@@ -523,40 +523,143 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
     def create_router(self, context, router):
         LOG.debug(_("MidonetPluginV2.create_router called: router=%r"), router)
 
-        if router['router']['admin_state_up'] is False:
-            LOG.warning(_('Ignoreing admin_state_up=False for router=%r',
+        r = router['router']
+        if r['admin_state_up'] is False:
+            LOG.warning(_('Ignoring admin_state_up=False for router=%r, '
                           'Overriding with True'), router)
-            router['router']['admin_state_up'] = True
+            r['admin_state_up'] = True
 
-        tenant_id = self._get_tenant_id_for_create(context, router['router'])
-        session = context.session
-        with session.begin(subtransactions=True):
+        tenant_id = self._get_tenant_id_for_create(context, r)
+        with context.session.begin(subtransactions=True):
             mrouter = self.mido_api.add_router().name(
-                router['router']['name']).tenant_id(tenant_id).create()
-            qrouter = super(MidonetPluginV2, self).create_router(context,
-                                                                 router)
+                r['name']).tenant_id(tenant_id).create()
 
-            chains = self.chain_manager.create_router_chains(tenant_id,
-                                                             mrouter.get_id())
+            # pre-generate id so it will be available when
+            # configuring external gw port
+            router_db = l3_db.Router(id=mrouter.get_id(),
+                                     tenant_id=tenant_id,
+                                     name=r['name'],
+                                     admin_state_up=r['admin_state_up'],
+                                     status="ACTIVE")
+            context.session.add(router_db)
 
             # set chains to in/out filters
+            chains = self.chain_manager.create_router_chains(tenant_id,
+                                                             mrouter.get_id())
             mrouter.inbound_filter_id(
                 chains['in'].get_id()).outbound_filter_id(
                 chains['out'].get_id()).update()
 
-            # get entry from the DB and update 'id' with MidoNet router id.
-            qrouter_entry = self._get_router(context, qrouter['id'])
-            qrouter['id'] = mrouter.get_id()
-            qrouter_entry.update(qrouter)
+            has_gw_info = False
+            if 'external_gateway_info' in r:
+                gw_info = r['external_gateway_info']
+                if gw_info is not None:
+                    has_gw_info = True
+                del r['external_gateway_info']
+            if has_gw_info:
+                self._update_router_gw_info(context, router_db['id'], gw_info)
+                gw_ip = router_db.gw_port.fixed_ips[0].ip_address
+                self._set_router_gateway(
+                    mrouter, self._get_provider_router(), gw_ip)
 
+            qrouter = self._make_router_dict(router_db)
             LOG.debug(_("MidonetPluginV2.create_router exiting: qrouter=%r"),
                       qrouter)
             return qrouter
+
+    def _set_router_gateway(self, router, gw_router, gw_ip):
+        """Set Midonet router uplink gateway
+
+        :param router: ID of the router
+        :param gw_router: gateway router to link to
+        :param gw_ip: gateway IP address
+        """
+        LOG.debug(_("MidonetPluginV2.set_router_gateway called: "
+                    "router=%(router)s, gw_router=%(gw_router)s, "
+                    "gw_ip=%(gw_ip)s"),
+                  {'router': router, 'gw_router': gw_router, 'gw_ip': gw_ip})
+
+        # Create a port on the gateway router.
+        gw_port = gw_router.add_interior_port().network_address(
+            '169.254.255.0').network_length(30).port_address(
+            '169.254.255.1').create()
+
+        # Create a port in the tenant router.
+        router_port = router.add_interior_port().network_address(
+            '169.254.255.0').network_length(30).port_address(
+            '169.254.255.2').create()
+
+        # Link them.
+        gw_port.link(router_port.get_id())
+
+        # Add a route for gw_ip to bring it down to tenant
+        gw_router.add_route().type('Normal').src_network_addr(
+            '0.0.0.0').src_network_length(0).dst_network_addr(
+            gw_ip).dst_network_length(32).weight(100).next_hop_port(
+            gw_port.get_id()).create()
+
+        # Add default route to uplink in the tenant router
+        router.add_route().type('Normal').src_network_addr(
+            '0.0.0.0').src_network_length(0).dst_network_addr(
+            '0.0.0.0').dst_network_length(0).weight(
+            100).next_hop_port(router_port.get_id()).create()
+
+        # ADD SNAT(masquerade) rules
+        chains = self.chain_manager.get_router_chains(
+            router.get_tenant_id(), router.get_id())
+
+        chains['in'].add_rule().nw_dst_address(gw_ip).nw_dst_length(
+            32).type('rev_snat').flow_action('accept').in_ports(
+            [router_port.get_id()]).properties(
+            SNAT_RULE_PROPERTY).position(1).create()
+
+        nat_targets = []
+        nat_targets.append(
+            {'addressFrom': gw_ip, 'addressTo': gw_ip,
+             'portFrom': 1, 'portTo': 65535})
+
+        chains['out'].add_rule().type('snat').flow_action(
+            'accept').nat_targets(nat_targets).out_ports(
+            [router_port.get_id()]).properties(
+            SNAT_RULE_PROPERTY).position(1).create()
+
+    def _clear_router_gateway(self, router):
+        # delete the port that is connected to provider router
+        for p in router.get_ports():
+            if p.get_port_address() == '169.254.255.2':
+                peer_port_id = p.get_peer_id()
+                p.unlink()
+                self.mido_api.get_port(peer_port_id).delete()
+                p.delete()
+
+        # delete default route
+        for r in router.get_routes():
+            if (r.get_dst_network_addr() == '0.0.0.0' and
+                r.get_dst_network_length() == 0):
+                r.delete()
+
+        # delete SNAT(masquerade) rules
+        chains = self.chain_manager.get_router_chains(
+            router.get_tenant_id(),
+            router.get_id())
+
+        for r in chains['in'].get_rules():
+            if OS_TENANT_ROUTER_RULE_KEY in r.get_properties():
+                if r.get_properties()[
+                    OS_TENANT_ROUTER_RULE_KEY] == SNAT_RULE:
+                    r.delete()
+
+        for r in chains['out'].get_rules():
+            if OS_TENANT_ROUTER_RULE_KEY in r.get_properties():
+                if r.get_properties()[
+                    OS_TENANT_ROUTER_RULE_KEY] == SNAT_RULE:
+                    r.delete()
 
     def update_router(self, context, id, router):
         LOG.debug(_("MidonetPluginV2.update_router called: id=%(id)s "
                     "router=%(router)r"), router)
 
+        # Admin state must be up.
         if router['router'].get('admin_state_up') is False:
             raise q_exc.NotImplementedError(_('admin_state_up=False '
                                               'routers are not '
@@ -573,14 +676,14 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
               router['router']['external_gateway_info'] == {}):
             op_gateway_clear = True
 
-            qports = super(MidonetPluginV2, self).get_ports(
-                context, {'device_id': [id],
-                          'device_owner': ['network:router_gateway']})
+        # Get the router's gateway port and its IP address.
+        qports = super(MidonetPluginV2, self).get_ports(
+            context, {'device_id': [id],
+                      'device_owner': ['network:router_gateway']})
 
-            assert len(qports) == 1
-            qport = qports[0]
-            snat_ip = qport['fixed_ips'][0]['ip_address']
-            qport['network_id']
+        assert len(qports) == 1
+        qport = qports[0]
+        snat_ip = qport['fixed_ips'][0]['ip_address']
 
         session = context.session
         with session.begin(subtransactions=True):
@@ -594,90 +697,13 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
             tenant_router = self.mido_api.get_router(id)
             if op_gateway_set:
-                # find a qport with the network_id for the router
-                qports = super(MidonetPluginV2, self).get_ports(
-                    context, {'device_id': [id],
-                              'device_owner': ['network:router_gateway']})
-                assert len(qports) == 1
-                qport = qports[0]
-                snat_ip = qport['fixed_ips'][0]['ip_address']
-
-                in_port = self._get_provider_router().add_interior_port()
-                pr_port = in_port.network_address(
-                    '169.254.255.0').network_length(30).port_address(
-                    '169.254.255.1').create()
-
-                # Create a port in the tenant router
-                tr_port = tenant_router.add_interior_port().network_address(
-                    '169.254.255.0').network_length(30).port_address(
-                    '169.254.255.2').create()
-
-                # Link them
-                pr_port.link(tr_port.get_id())
-
-                # Add a route for snat_ip to bring it down to tenant
-                self._get_provider_router().add_route().type(
-                    'Normal').src_network_addr('0.0.0.0').src_network_length(
-                    0).dst_network_addr(snat_ip).dst_network_length(
-                    32).weight(100).next_hop_port(pr_port.get_id()).create()
-
-                # Add default route to uplink in the tenant router
-                tenant_router.add_route().type('Normal').src_network_addr(
-                    '0.0.0.0').src_network_length(0).dst_network_addr(
-                    '0.0.0.0').dst_network_length(0).weight(
-                    100).next_hop_port(tr_port.get_id()).create()
-
-                # ADD SNAT(masquerade) rules
-                chains = self.chain_manager.get_router_chains(
-                    tenant_router.get_tenant_id(), tenant_router.get_id())
-
-                chains['in'].add_rule().nw_dst_address(snat_ip).nw_dst_length(
-                    32).type('rev_snat').flow_action('accept').in_ports(
-                    [tr_port.get_id()]).properties(
-                    SNAT_RULE_PROPERTY).position(1).create()
-
-                nat_targets = []
-                nat_targets.append(
-                    {'addressFrom': snat_ip, 'addressTo': snat_ip,
-                     'portFrom': 1, 'portTo': 65535})
-
-                chains['out'].add_rule().type('snat').flow_action(
-                    'accept').nat_targets(nat_targets).out_ports(
-                    [tr_port.get_id()]).properties(
-                    SNAT_RULE_PROPERTY).position(1).create()
+                self._set_router_gateway(tenant_router,
+                                         self._get_provider_router(),
+                                         snat_ip)
 
             if op_gateway_clear:
-                # delete the port that is connected to provider router
-                for p in tenant_router.get_ports():
-                    if p.get_port_address() == '169.254.255.2':
-                        peer_port_id = p.get_peer_id()
-                        p.unlink()
-                        self.mido_api.get_port(peer_port_id).delete()
-                        p.delete()
-
-                # delete default route
-                for r in tenant_router.get_routes():
-                    if (r.get_dst_network_addr() == '0.0.0.0' and
-                            r.get_dst_network_length() == 0):
-                        r.delete()
-
-                # delete SNAT(masquerade) rules
-                chains = self.chain_manager.get_router_chains(
-                    tenant_router.get_tenant_id(),
-                    tenant_router.get_id())
-
-                for r in chains['in'].get_rules():
-                    if OS_TENANT_ROUTER_RULE_KEY in r.get_properties():
-                        if r.get_properties()[
-                                OS_TENANT_ROUTER_RULE_KEY] == SNAT_RULE:
-                            r.delete()
-
-                for r in chains['out'].get_rules():
-                    if OS_TENANT_ROUTER_RULE_KEY in r.get_properties():
-                        if r.get_properties()[
-                                OS_TENANT_ROUTER_RULE_KEY] == SNAT_RULE:
-                            r.delete()
-
+                self._clear_router_gateway(tenant_router)
+                                           
         LOG.debug(_("MidonetPluginV2.update_router exiting: qrouter=%r"),
                   qrouter)
         return qrouter
@@ -691,6 +717,9 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         session = context.session
         with session.begin(subtransactions=True):
             result = super(MidonetPluginV2, self).delete_router(context, id)
+
+            # If router is linked to provider router, unlink it.
+            self._clear_router_gateway(mrouter)
 
             # delete corresponding chains
             chains = self.chain_manager.get_router_chains(tenant_id,
@@ -878,6 +907,9 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             floating_address = floatingip_db['floating_ip_address']
             id = floatingip_db['id']
 
+            # Clear the old association if there is one.
+            self._clear_midonet_fip_assoc(context, tenant_id, floatingip_db)
+
             if 'port_id' in fip and fip['port_id']:
                 port_id, internal_ip_address, router_id = self.get_assoc_data(
                    context,
@@ -933,38 +965,44 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                     [tr_port_id]).position(1).properties(
                     floating_property).create()
 
-            # disassociate floating IP
-            elif 'port_id' in fip and fip['port_id'] is None:
-                router_id = floatingip_db['router_id']
-                if not router_id:
-                    return
-
-                # delete the route for this floating ip
-                for r in self._get_provider_router().get_routes():
-                    if (r.get_dst_network_addr() == floating_address and
-                            r.get_dst_network_length() == 32):
-                        r.delete()
-
-                # delete snat/dnat rule pair for this floating ip
-                chains = self.chain_manager.get_router_chains(tenant_id,
-                                                              router_id)
-                LOG.debug(_('chains=%r'), chains)
-
-                for r in chains['in'].get_rules():
-                    if OS_FLOATING_IP_RULE_KEY in r.get_properties():
-                        if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == id:
-                            LOG.debug(_('deleting rule=%r'), r)
-                            r.delete()
-                            break
-
-                for r in chains['out'].get_rules():
-                    if OS_FLOATING_IP_RULE_KEY in r.get_properties():
-                        if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == id:
-                            LOG.debug(_('deleting rule=%r'), r)
-                            r.delete()
-                            break
-
         LOG.debug(_("MidonetPluginV2._update_fip_assoc exiting"))
+
+    def _clear_midonet_fip_assoc(self, context, tenant_id, floatingip_db):
+        """Clears the floating IP's Midonet associations. Idempotent."""
+        LOG.debug(_("MidonetPluginV2._clear_midonet_fip_assoc called: "
+                    "tenant_id=%(tenant_id)s, floatingip_db=%(floatingip_db)s"),
+                  {'tenant_id': tenant_id, 'floatingip_db': floatingip_db})
+
+        router_id = floatingip_db['router_id']
+        if not router_id:
+            return
+
+        # delete the route for this floating ip
+        floating_address = floatingip_db['floating_ip_address']
+        for r in self._get_provider_router().get_routes():
+            if (r.get_dst_network_addr() == floating_address and
+                    r.get_dst_network_length() == 32):
+                r.delete()
+
+        # delete snat/dnat rule pair for this floating ip
+        chains = self.chain_manager.get_router_chains(tenant_id, router_id)
+        LOG.debug(_('chains=%r'), chains)
+
+        for r in chains['in'].get_rules():
+            if OS_FLOATING_IP_RULE_KEY in r.get_properties():
+                if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == id:
+                    LOG.debug(_('deleting rule=%r'), r)
+                    r.delete()
+                    break
+
+        for r in chains['out'].get_rules():
+            if OS_FLOATING_IP_RULE_KEY in r.get_properties():
+                if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == id:
+                    LOG.debug(_('deleting rule=%r'), r)
+                    r.delete()
+                    break
+
+        LOG.debug(_("MidonetPluginV2._clear_fip_assoc exiting"))
 
     #
     # Security groups supporting methods
