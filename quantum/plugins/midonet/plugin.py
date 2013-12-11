@@ -19,6 +19,7 @@
 # @author: Takaaki Suzuki, Midokura Japan KK
 # @author: Tomoe Sugihara, Midokura Japan KK
 # @author: Ryu Ishimoto, Midokura Japan KK
+import uuid
 
 from midonetclient import api
 from oslo.config import cfg
@@ -145,10 +146,6 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
         net = super(MidonetPluginV2, self).get_network(
             context, subnet['subnet']['network_id'], fields=None)
-        if net['subnets']:
-            raise q_exc.NotImplementedError(
-                _("MidoNet doesn't support multiple subnets "
-                  "on the same network."))
 
         session = context.session
         with session.begin(subtransactions=True):
@@ -212,13 +209,18 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                                           id=bridge_id)
 
         # get dhcp subnet data from MidoNet bridge.
+        network_address, prefix = qsubnet['cidr'].split('/')
         dhcps = bridge.get_dhcp_subnets()
-        b_network_address = dhcps[0].get_subnet_prefix()
-        b_prefix = dhcps[0].get_subnet_length()
+        found = False
+        for dhcp in dhcps:
+            b_network_address = dhcp.get_subnet_prefix()
+            b_prefix = dhcp.get_subnet_length()
+            if network_address == b_network_address or int(prefix) == b_prefix:
+                found = True
+                break
 
         # Validate against quantum database.
-        network_address, prefix = qsubnet['cidr'].split('/')
-        if network_address != b_network_address or int(prefix) != b_prefix:
+        if found is False:
             raise MidonetResourceNotFound(resource_type='DhcpSubnet',
                                           id=qsubnet['cidr'])
 
@@ -249,8 +251,11 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                 raise MidonetResourceNotFound(resource_type='Bridge',
                                               id=bridge_id)
 
-            dhcp = bridge.get_dhcp_subnets()
-            dhcp[0].delete()
+            dhcps = bridge.get_dhcp_subnets()
+            for dhcp in dhcps:
+                if dhcp.get_subnet_prefix() == subnet['cidr']:
+                    dhcp.delete()
+                    break
 
             # If the network is external, clean up routes, links, ports.
             self._extend_network_dict_l3(context, net)
@@ -294,6 +299,8 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         tenant_id = self._get_tenant_id_for_create(context, network['network'])
 
         self._ensure_default_security_group(context, tenant_id)
+        if not network['network']['name']:
+            network['network']['name'] = str(uuid.uuid4())
 
         session = context.session
         with session.begin(subtransactions=True):
@@ -401,10 +408,7 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
         device_owner = port_data['device_owner']
 
-        if device_owner.startswith('compute:') or device_owner is '':
-            is_compute_interface = True
-            bridge_port = bridge.add_exterior_port().create()
-        elif device_owner.startswith('network:dhcp'):
+        if device_owner.startswith('network:dhcp'):
             is_dhcp_interface = True
             bridge_port = bridge.add_exterior_port().create()
         elif device_owner == l3_db.DEVICE_OWNER_ROUTER_INTF:
@@ -415,8 +419,8 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             # This will not be used in MidoNet
             bridge_port = bridge.add_interior_port().create()
         else:
-            raise q_exc.NotImplementedError(
-                _("MidoNet doesn't recognize this owner"))
+            is_compute_interface = True
+            bridge_port = bridge.add_exterior_port().create()
 
         if bridge_port:
             # set midonet port id to quantum port id and create a DB record.
@@ -448,6 +452,7 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                         dhcp_subnets[0].add_dhcp_host().ip_addr(
                             fixed_ip).mac_addr(mac).create()
             elif is_dhcp_interface:
+                fixed_ip = port_db_entry['fixed_ips'][0]['ip_address']
                 dhcp_subnets = bridge.get_dhcp_subnets()
                 routes = [{'destinationPrefix': METADATA_DEFAULT_IP,
                            'destinationLength': 32,

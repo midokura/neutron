@@ -224,7 +224,6 @@ class RuleManager:
         remote_ip_prefix = rule['remote_ip_prefix']  # watch out. not validated
         tenant_id = rule['tenant_id']
         port_range_min = rule['port_range_min']
-        external_id = rule['external_id']
 
         # construct a corresponding rule
         tp_src_start = tp_src_end = None
@@ -240,8 +239,8 @@ class RuleManager:
             source_pg = self.pg_manager.get_for_sg(tenant_id, remote_group_id)
             port_group_id = source_pg.get_id()
         else:
-            raise Exception(_("Don't know what to do with rule=%r"), rule)
-
+            LOG.warn(_("This rule has no remote ip or remote group id set=%r"), 
+                       rule)
         # dst ports
         tp_dst_start, tp_dst_end = port_range_min, port_range_max
 
@@ -282,9 +281,10 @@ class RuleManager:
                   {'rule_id': rule_id, 'port_group_id': port_group_id})
         chain.add_rule().port_group(port_group_id).type('accept').nw_proto(
             nw_proto).nw_src_address(nw_src_address).nw_src_length(
-                nw_src_length).tp_src_start(tp_src_start).tp_src_end(
-                    tp_src_end).tp_dst_start(tp_dst_start).tp_dst_end(
-                        tp_dst_end).properties(properties).create()
+                nw_src_length).tp_src(
+                    {"start":tp_src_start, "end":tp_src_end}).tp_dst(
+                        {"start":tp_dst_start, "end":tp_dst_end}).properties(
+                            properties).create()
 
     def delete_for_sg_rule(self, rule):
         LOG.debug(_("RuleManager.delete_for_sg_rule called: rule=%r"), rule)
