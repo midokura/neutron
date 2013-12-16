@@ -1,6 +1,6 @@
 Name:       python-quantum-midonet
 Epoch:      1
-Version:    2013.1.2.mido6
+Version:    2013.1.2.mido7
 Release:    0 
 Summary:    OpenStack Midonet plugin
 Group:      Applications/System
@@ -27,6 +27,7 @@ cp -r quantum/plugins/midonet $RPM_BUILD_ROOT/%{python_sitelib}/quantum/plugins/
 %{python_sitelib}/quantum/plugins/midonet
 
 %changelog
+* Mon Dec 16 2013 Dave Cahill <dcahill@midokura.com> - 2013.1.2.mido7
 * Mon Nov 18 2013 Dave Cahill <dcahill@midokura.com> - 2013.1.2.mido6
 * Fri Nov 15 2013 Dave Cahill <dcahill@midokura.com> - 2013.1.2.mido5
 * Mon Aug 5 2013 Guillermo Ontanon <guillermo@midokura.com> - 2013.1.2.mido4
