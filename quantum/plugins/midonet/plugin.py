@@ -919,8 +919,8 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
     def _update_fip_assoc(self, context, fip, floatingip_db, external_port):
         LOG.debug(_("MidonetPluginV2._update_fip_assoc called: fip=%(fip)s"
                     "floatingip_db=%(floatingip_db)s, "
-                    "external_port=%(external_port)s"), 
-                  {'fip': fip, 'floatingip_db': floatingip_db, 
+                    "external_port=%(external_port)s"),
+                  {'fip': fip, 'floatingip_db': floatingip_db,
                    'external_port': external_port})
 
         session = context.session
@@ -928,13 +928,16 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         tenant_id = fip['tenant_id']
         floating_address = floatingip_db['floating_ip_address']
         id = floatingip_db['id']
+
         with session.begin(subtransactions=True):
-            super(MidonetPluginV2, self)._update_fip_assoc(context, fip, 
+
+            super(MidonetPluginV2, self)._update_fip_assoc(context, fip,
                 floatingip_db, external_port)
 
-
             # Clear the old association if there is one.
-            self._clear_midonet_fip_assoc(context, tenant_id, floatingip_db)
+            if router_id:
+                self._clear_midonet_fip_assoc(context, tenant_id, router_id,
+                                              floating_address)
 
             if 'port_id' in fip and fip['port_id']:
                 port_id, internal_ip_address, router_id = self.get_assoc_data(
@@ -993,20 +996,18 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
         LOG.debug(_("MidonetPluginV2._update_fip_assoc exiting"))
 
-    def _clear_midonet_fip_assoc(self, context, tenant_id, floatingip_db):
+    def _clear_midonet_fip_assoc(self, context, tenant_id, router_id,
+                                 fip_address):
         """Clears the floating IP's Midonet associations. Idempotent."""
         LOG.debug(_("MidonetPluginV2._clear_midonet_fip_assoc called: "
-                    "tenant_id=%(tenant_id)s, floatingip_db=%(floatingip_db)s"),
-                  {'tenant_id': tenant_id, 'floatingip_db': floatingip_db})
-
-        router_id = floatingip_db['router_id']
-        if not router_id:
-            return
+                    "tenant_id=%(tenant_id)s, router_id=%(router_id)s, "
+                    "fip_address=%(fip_address)s"),
+                  {'tenant_id': tenant_id, 'router_id': router_id,
+                   'fip_address': fip_address})
 
         # delete the route for this floating ip
-        floating_address = floatingip_db['floating_ip_address']
         for r in self._get_provider_router().get_routes():
-            if (r.get_dst_network_addr() == floating_address and
+            if (r.get_dst_network_addr() == fip_address and
                     r.get_dst_network_length() == 32):
                 r.delete()
 
