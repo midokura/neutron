@@ -552,8 +552,6 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             fip_qry = context.session.query(l3_db.FloatingIP)
             floating_ip = fip_qry.filter_by(fixed_port_id=port_id).one()
             fip_addr = floating_ip['floating_ip_address']
-            import pdb
-            pdb.set_trace()
             tenant_id = floating_ip['tenant_id']
             router_id = floating_ip['router_id']
             super(MidonetPluginV2, self).disassociate_floatingips(context, port_id)
