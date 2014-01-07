@@ -554,9 +554,10 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             fip_addr = floating_ip['floating_ip_address']
             tenant_id = floating_ip['tenant_id']
             router_id = floating_ip['router_id']
+            fip_id = floating_ip['id']
             super(MidonetPluginV2, self).disassociate_floatingips(context, port_id)
             self._clear_midonet_fip_assoc(context, tenant_id, router_id,
-                                          fip_addr)
+                                          fip_addr, fip_id)
         except exc.NoResultFound:
             pass
 
@@ -941,7 +942,7 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         router_id = floatingip_db['router_id']
         tenant_id = fip['tenant_id']
         floating_address = floatingip_db['floating_ip_address']
-        id = floatingip_db['id']
+        fip_id = floatingip_db['id']
 
         with session.begin(subtransactions=True):
 
@@ -951,7 +952,7 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             # Clear the old association if there is one.
             if router_id:
                 self._clear_midonet_fip_assoc(context, tenant_id, router_id,
-                                              floating_address)
+                                              floating_address, fip_id)
 
             if 'port_id' in fip and fip['port_id']:
                 port_id, internal_ip_address, router_id = self.get_assoc_data(
@@ -987,7 +988,7 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                     {'addressFrom': fixed_address, 'addressTo': fixed_address,
                      'portFrom': 0, 'portTo': 0})
 
-                floating_property = {OS_FLOATING_IP_RULE_KEY: id}
+                floating_property = {OS_FLOATING_IP_RULE_KEY: fip_id}
                 chains['in'].add_rule().nw_dst_address(
                     floating_address).nw_dst_length(32).type(
                     'dnat').flow_action('accept').nat_targets(
@@ -1011,7 +1012,7 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         LOG.debug(_("MidonetPluginV2._update_fip_assoc exiting"))
 
     def _clear_midonet_fip_assoc(self, context, tenant_id, router_id,
-                                 fip_address):
+                                 fip_address, fip_id):
         """Clears the floating IP's Midonet associations. Idempotent."""
         LOG.debug(_("MidonetPluginV2._clear_midonet_fip_assoc called: "
                     "tenant_id=%(tenant_id)s, router_id=%(router_id)s, "
@@ -1031,14 +1032,14 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
         for r in chains['in'].get_rules():
             if OS_FLOATING_IP_RULE_KEY in r.get_properties():
-                if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == id:
+                if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == fip_id:
                     LOG.debug(_('deleting rule=%r'), r)
                     r.delete()
                     break
 
         for r in chains['out'].get_rules():
             if OS_FLOATING_IP_RULE_KEY in r.get_properties():
-                if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == id:
+                if r.get_properties()[OS_FLOATING_IP_RULE_KEY] == fip_id:
                     LOG.debug(_('deleting rule=%r'), r)
                     r.delete()
                     break
