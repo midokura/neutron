@@ -25,6 +25,7 @@ from midonetclient import api
 from oslo.config import cfg
 from webob import exc as w_exc
 
+from sqlalchemy.orm import exc
 from eventlet.semaphore import Semaphore
 from quantum.common import exceptions as q_exc
 from quantum.common.utils import find_config_file
@@ -521,6 +522,7 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         with PORT_ALLOC_SEM:
             session = context.session
             with session.begin(subtransactions=True):
+                self.disassociate_floatingips(context, id)
                 port_db_entry = super(MidonetPluginV2, self).get_port(context,
                                                                       id, None)
                 bridge = self.mido_api.get_bridge(port_db_entry['network_id'])
@@ -544,6 +546,21 @@ class MidonetPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
     #
     # L3 APIs.
     #
+
+    def disassociate_floatingips(self, context, port_id):
+        try:
+            fip_qry = context.session.query(l3_db.FloatingIP)
+            floating_ip = fip_qry.filter_by(fixed_port_id=port_id).one()
+            fip_addr = floating_ip['floating_ip_address']
+            import pdb
+            pdb.set_trace()
+            tenant_id = floating_ip['tenant_id']
+            router_id = floating_ip['router_id']
+            super(MidonetPluginV2, self).disassociate_floatingips(context, port_id)
+            self._clear_midonet_fip_assoc(context, tenant_id, router_id,
+                                          fip_addr)
+        except exc.NoResultFound:
+            pass
 
     def create_router(self, context, router):
         LOG.debug(_("MidonetPluginV2.create_router called: router=%r"), router)
