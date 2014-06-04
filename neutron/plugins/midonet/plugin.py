@@ -659,7 +659,7 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         # Create a bridge port in MidoNet and set the bridge port ID as the
         # port ID in Neutron.
         bridge = self.client.get_bridge(port_data["network_id"])
-        tenant_id = bridge.get_tenant_id()
+        tenant_id = port_data['tenant_id']
         asu = port_data.get("admin_state_up", True)
         bridge_port = self.client.add_bridge_port(bridge,
                                                   admin_state_up=asu)
