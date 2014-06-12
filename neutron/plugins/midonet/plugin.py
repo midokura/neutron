@@ -630,25 +630,31 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         LOG.info(_("MidonetPluginV2.delete_network called: id=%r"), id)
         net = super(MidonetPluginV2, self).get_network(context, id,
                                                        fields=None)
+        # Before deleting the network, lets cache its subnets. This way
+        # we can do all the required cleanup even after the network
+        # and all of its subnets are gone.
+        subnets = list()
+        for subnet_id in net['subnets']:
+            subnets.append(self._get_subnet(context, subnet_id))
 
-        try:
-            super(MidonetPluginV2, self).delete_network(context, id)
-        except Exception:
-            LOG.error(_('Failed to delete neutron db, while Midonet bridge=%r'
-                      'had been deleted'), id)
-            raise
+        with context.session.begin(subtransactions=True):
+            try:
+                super(MidonetPluginV2, self).delete_network(context, id)
+            except Exception:
+                LOG.error(_('Failed to delete neutron db, while Midonet '
+                          'bridge=%r had been deleted'), id)
+                raise
 
-        # if the network is external, it may need to have its bridges
-        # unplugged from the provider router.
-        if net[ext_net.EXTERNAL]:
-            # we currently only support one subnet in a network, so this
-            # loop will only execute 0 or 1 times currently.
-            for subnet_id in net['subnets']:
-                subnet = self._get_subnet(context, subnet_id)
-                bridge = self.client.get_bridge(id)
-                self._unlink_from_provider_router(bridge, subnet)
+            # if the network is external, it may need to have its bridges
+            # unplugged from the provider router.
+            if net[ext_net.EXTERNAL]:
+                # we currently only support one subnet in a network, so this
+                # loop will only execute 0 or 1 times currently.
+                for subnet in subnets:
+                    bridge = self.client.get_bridge(id)
+                    self._unlink_from_provider_router(bridge, subnet)
 
-        self.client.delete_bridge(id)
+            self.client.delete_bridge(id)
 
     @utils.synchronized('port-critical-section', external=True)
     def create_port(self, context, port):
