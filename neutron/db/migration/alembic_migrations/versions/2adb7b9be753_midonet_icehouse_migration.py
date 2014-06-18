@@ -43,9 +43,19 @@ def upgrade(active_plugins=None, options=None):
 
     op.add_column('routers', sa.Column('enable_snat', sa.Boolean(), nullable=False))
 
+    op.create_table(
+        'quotas',
+        sa.Column('id', sa.String(length=36), nullable=False),
+        sa.Column('tenant_id', sa.String(length=255), nullable=True),
+        sa.Column('resource', sa.String(length=255), nullable=True),
+        sa.Column('limit', sa.Integer(), nullable=True),
+        sa.PrimaryKeyConstraint('id')
+    )
+
 
 def downgrade(active_plugins=None, options=None):
     if not migration.should_run(active_plugins, migration_for_plugins):
         return
 
+    op.drop_table('quotas')
     op.drop_column('routers', 'enable_snat')
