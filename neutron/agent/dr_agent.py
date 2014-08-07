@@ -13,11 +13,11 @@
 #    under the License.
 #
 # @author: Jaume Devesa, devvesa@gmail.com, Midokura SARL
+
 import socket
 import sys
 
 from oslo.config import cfg
-from ryu.services.protocols.bgp import bgpspeaker
 
 from neutron.agent.common import config
 from neutron.agent.linux import external_process
