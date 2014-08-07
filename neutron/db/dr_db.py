@@ -17,6 +17,7 @@ from sqlalchemy.orm import exc
 
 from neutron.common import utils
 from neutron.db import db_base_plugin_v2 as base_db
+from neutron.db import extraroute_db
 from neutron.db import model_base
 from neutron.db import models_v2
 from neutron.extensions import dynamic_routing as dr
@@ -75,7 +76,8 @@ class AdvertiseRoute(model_base.BASEV2):
 
 
 class DynamicRoutingDbMixin(dr.DynamicRoutingPluginBase,
-                            base_db.NeutronDbPluginV2):
+                            base_db.NeutronDbPluginV2,
+                            extraroute_db.ExtraRoute_db_mixin):
 
     def create_routingpeer(self, context, routingpeer):
         LOG.debug(_("create_routingpeer() called"))

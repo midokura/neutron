@@ -3,13 +3,14 @@
 # This file is distributed under the same license as the neutron project.
 #
 # Translators:
+# Andi Chandler <andi@gowling.com>, 2014
 msgid ""
 msgstr ""
 "Project-Id-Version: Neutron\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2014-07-21 06:06+0000\n"
-"PO-Revision-Date: 2014-06-30 19:27+0000\n"
-"Last-Translator: openstackjenkins <jenkins@openstack.org>\n"
+"POT-Creation-Date: 2014-08-01 06:06+0000\n"
+"PO-Revision-Date: 2014-07-25 23:10+0000\n"
+"Last-Translator: Andi Chandler <andi@gowling.com>\n"
 "Language-Team: English (United Kingdom) (http://www.transifex.com/projects/p/"
 "neutron/language/en_GB/)\n"
 "Language: en_GB\n"
@@ -25,11 +26,13 @@ msgid ""
 "Found deprecated policy rule:%s. Please consider upgrading your policy "
 "configuration file"
 msgstr ""
+"Found deprecated policy rule:%s. Please consider upgrading your policy "
+"configuration file"
 
 #: neutron/policy.py:137
 #, python-format
 msgid "Unable to find data type descriptor for attribute %s"
-msgstr ""
+msgstr "Unable to find data type descriptor for attribute %s"
 
 #: neutron/openstack/common/service.py:364
 #, python-format

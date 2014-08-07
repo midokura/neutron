@@ -23,13 +23,16 @@ import netaddr
 from oslo.config import cfg
 from ryu.app.ofctl import api as ryu_api
 from ryu.base import app_manager
+from ryu.controller import handler
+from ryu.controller import ofp_event
 from ryu.lib import hub
+from ryu.lib.packet import arp
+from ryu.ofproto import ether
 from ryu.ofproto import ofproto_v1_3 as ryu_ofp13
 
 from neutron.agent import l2population_rpc
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import ovs_lib
-from neutron.agent.linux import polling
 from neutron.agent.linux import utils
 from neutron.agent import rpc as agent_rpc
 from neutron.agent import securitygroups_rpc as sg_rpc
@@ -41,6 +44,7 @@ from neutron import context
 from neutron.openstack.common import log as logging
 from neutron.openstack.common import loopingcall
 from neutron.plugins.common import constants as p_const
+from neutron.plugins.ofagent.agent import arp_lib
 from neutron.plugins.ofagent.agent import ports
 from neutron.plugins.ofagent.common import config  # noqa
 from neutron.plugins.openvswitch.common import constants
@@ -132,8 +136,11 @@ class OFASecurityGroupAgent(sg_rpc.SecurityGroupAgentRpcMixin):
 class OFANeutronAgentRyuApp(app_manager.RyuApp):
     OFP_VERSIONS = [ryu_ofp13.OFP_VERSION]
 
-    def start(self):
+    def __init__(self, *args, **kwargs):
+        super(OFANeutronAgentRyuApp, self).__init__(*args, **kwargs)
+        self.arplib = arp_lib.ArpLib(self)
 
+    def start(self):
         super(OFANeutronAgentRyuApp, self).start()
         return hub.spawn(self._agent_main, self)
 
@@ -160,6 +167,16 @@ class OFANeutronAgentRyuApp(app_manager.RyuApp):
         LOG.info(_("Agent initialized successfully, now running... "))
         agent.daemon_loop()
 
+    @handler.set_ev_cls(ofp_event.EventOFPPacketIn, handler.MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        self.arplib.packet_in_handler(ev)
+
+    def add_arp_table_entry(self, network, ip, mac):
+        self.arplib.add_arp_table_entry(network, ip, mac)
+
+    def del_arp_table_entry(self, network, ip):
+        self.arplib.del_arp_table_entry(network, ip)
+
 
 class OFANeutronAgent(n_rpc.RpcCallback,
                       sg_rpc.SecurityGroupAgentRpcCallbackMixin,
@@ -182,9 +199,7 @@ class OFANeutronAgent(n_rpc.RpcCallback,
     def __init__(self, ryuapp, integ_br, tun_br, local_ip,
                  bridge_mappings, root_helper,
                  polling_interval, tunnel_types=None,
-                 veth_mtu=None, minimize_polling=False,
-                 ovsdb_monitor_respawn_interval=(
-                     constants.DEFAULT_OVSDBMON_RESPAWN)):
+                 veth_mtu=None):
         """Constructor.
 
         :param ryuapp: object of the ryu app.
@@ -198,11 +213,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                the agent. If set, will automatically set enable_tunneling to
                True.
         :param veth_mtu: MTU size for veth interfaces.
-        :param minimize_polling: Optional, whether to minimize polling by
-               monitoring ovsdb for interface changes.
-        :param ovsdb_monitor_respawn_interval: Optional, when using polling
-               minimization, the number of seconds to wait before respawning
-               the ovsdb monitor.
         """
         super(OFANeutronAgent, self).__init__()
         self.ryuapp = ryuapp
@@ -236,8 +246,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                                p_const.TYPE_VXLAN: {}}
 
         self.polling_interval = polling_interval
-        self.minimize_polling = minimize_polling
-        self.ovsdb_monitor_respawn_interval = ovsdb_monitor_respawn_interval
 
         self.enable_tunneling = bool(self.tunnel_types)
         self.local_ip = local_ip
@@ -246,8 +254,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
         self.dont_fragment = cfg.CONF.AGENT.dont_fragment
         if self.enable_tunneling:
             self.setup_tunnel_br(tun_br)
-        # Collect additional bridges to monitor
-        self.ancillary_brs = self.setup_ancillary_bridges(integ_br, tun_br)
 
         # Security group agent support
         self.sg_agent = OFASecurityGroupAgent(self.context,
@@ -351,7 +357,7 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                                                      self.local_vlan_map):
             agent_ports.pop(self.local_ip, None)
             if len(agent_ports):
-                self.fdb_add_tun(context, lvm, agent_ports,
+                self.fdb_add_tun(context, self.tun_br, lvm, agent_ports,
                                  self.tun_br_ofports)
 
     def fdb_remove(self, context, fdb_entries):
@@ -360,11 +366,11 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                                                      self.local_vlan_map):
             agent_ports.pop(self.local_ip, None)
             if len(agent_ports):
-                self.fdb_remove_tun(context, lvm, agent_ports,
+                self.fdb_remove_tun(context, self.tun_br, lvm, agent_ports,
                                     self.tun_br_ofports)
 
-    def _add_fdb_flooding_flow(self, lvm):
-        datapath = self.tun_br.datapath
+    def _add_fdb_flooding_flow(self, br, lvm):
+        datapath = br.datapath
         ofp = datapath.ofproto
         ofpp = datapath.ofproto_parser
         match = ofpp.OFPMatch(
@@ -383,14 +389,16 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                               match=match, instructions=instructions)
         self.ryu_send_msg(msg)
 
-    def add_fdb_flow(self, port_info, remote_ip, lvm, ofport):
-        datapath = self.tun_br.datapath
+    def add_fdb_flow(self, br, port_info, remote_ip, lvm, ofport):
+        datapath = br.datapath
         ofp = datapath.ofproto
         ofpp = datapath.ofproto_parser
         if port_info == n_const.FLOODING_ENTRY:
             lvm.tun_ofports.add(ofport)
-            self._add_fdb_flooding_flow(lvm)
+            self._add_fdb_flooding_flow(br, lvm)
         else:
+            self.ryuapp.add_arp_table_entry(
+                lvm.vlan, port_info[1], port_info[0])
             match = ofpp.OFPMatch(
                 vlan_vid=int(lvm.vlan) | ofp.OFPVID_PRESENT,
                 eth_dst=port_info[0])
@@ -407,14 +415,14 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                                   match=match, instructions=instructions)
             self.ryu_send_msg(msg)
 
-    def del_fdb_flow(self, port_info, remote_ip, lvm, ofport):
-        datapath = self.tun_br.datapath
+    def del_fdb_flow(self, br, port_info, remote_ip, lvm, ofport):
+        datapath = br.datapath
         ofp = datapath.ofproto
         ofpp = datapath.ofproto_parser
         if port_info == n_const.FLOODING_ENTRY:
             lvm.tun_ofports.remove(ofport)
             if len(lvm.tun_ofports) > 0:
-                self._add_fdb_flooding_flow(lvm)
+                self._add_fdb_flooding_flow(br, lvm)
             else:
                 # This local vlan doesn't require any more tunelling
                 match = ofpp.OFPMatch(
@@ -427,6 +435,7 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                                       match=match)
                 self.ryu_send_msg(msg)
         else:
+            self.ryuapp.del_arp_table_entry(lvm.vlan, port_info[1])
             match = ofpp.OFPMatch(
                 vlan_vid=int(lvm.vlan) | ofp.OFPVID_PRESENT,
                 eth_dst=port_info[0])
@@ -437,6 +446,18 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                                   out_port=ofp.OFPP_ANY,
                                   match=match)
             self.ryu_send_msg(msg)
+
+    def setup_entry_for_arp_reply(self, br, action, local_vid, mac_address,
+                                  ip_address):
+        if action == 'add':
+            self.ryuapp.add_arp_table_entry(local_vid, ip_address, mac_address)
+        elif action == 'remove':
+            self.ryuapp.del_arp_table_entry(local_vid, ip_address)
+
+    def _fdb_chg_ip(self, context, fdb_entries):
+        LOG.debug("update chg_ip received")
+        self.fdb_chg_ip_tun(context, self.tun_br, fdb_entries, self.local_ip,
+                            self.local_vlan_map)
 
     def _provision_local_vlan_inbound_for_tunnel(self, lvid, network_type,
                                                  segmentation_id):
@@ -642,7 +663,8 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                 self.ryu_send_msg(msg)
                 # Try to remove tunnel ports if not used by other networks
                 for ofport in lvm.tun_ofports:
-                    self.cleanup_tunnel_port(ofport, lvm.network_type)
+                    self.cleanup_tunnel_port(self.tun_br, ofport,
+                                             lvm.network_type)
         elif lvm.network_type in (p_const.TYPE_FLAT, p_const.TYPE_VLAN):
             if lvm.physical_network in self.phys_brs:
                 self._reclaim_local_vlan_outbound(lvm)
@@ -754,31 +776,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                                               instructions=instructions)
         self.ryu_send_msg(msg)
 
-    def setup_ancillary_bridges(self, integ_br, tun_br):
-        """Setup ancillary bridges - for example br-ex."""
-        ovs_bridges = set(ovs_lib.get_bridges(self.root_helper))
-        # Remove all known bridges
-        ovs_bridges.remove(integ_br)
-        if self.enable_tunneling:
-            ovs_bridges.remove(tun_br)
-        br_names = [self.phys_brs[physical_network].br_name for
-                    physical_network in self.phys_brs]
-        ovs_bridges.difference_update(br_names)
-        # Filter list of bridges to those that have external
-        # bridge-id's configured
-        br_names = [
-            bridge for bridge in ovs_bridges
-            if bridge != ovs_lib.get_bridge_external_bridge_id(
-                self.root_helper, bridge)
-        ]
-        ovs_bridges.difference_update(br_names)
-        ancillary_bridges = []
-        for bridge in ovs_bridges:
-            br = OVSBridge(bridge, self.root_helper, self.ryuapp)
-            ancillary_bridges.append(br)
-        LOG.info(_('ancillary bridge list: %s.'), ancillary_bridges)
-        return ancillary_bridges
-
     def _tun_br_sort_incoming_traffic_depend_in_port(self, br):
         match = br.ofparser.OFPMatch(
             in_port=int(self.patch_int_ofport))
@@ -792,6 +789,22 @@ class OFANeutronAgent(n_rpc.RpcCallback,
         msg = br.ofparser.OFPFlowMod(br.datapath, priority=0)
         self.ryu_send_msg(msg)
 
+    def _tun_br_output_arp_packet_to_controller(self, br):
+        datapath = br.datapath
+        ofp = datapath.ofproto
+        ofpp = datapath.ofproto_parser
+        match = ofpp.OFPMatch(eth_type=ether.ETH_TYPE_ARP,
+                              arp_op=arp.ARP_REQUEST)
+        actions = [ofpp.OFPActionOutput(ofp.OFPP_CONTROLLER)]
+        instructions = [
+            ofpp.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        msg = ofpp.OFPFlowMod(datapath,
+                              table_id=constants.PATCH_LV_TO_TUN,
+                              priority=10,
+                              match=match,
+                              instructions=instructions)
+        self.ryu_send_msg(msg)
+
     def _tun_br_goto_table_ucast_unicast(self, br):
         match = br.ofparser.OFPMatch(eth_dst=('00:00:00:00:00:00',
                                               '01:00:00:00:00:00'))
@@ -799,6 +812,7 @@ class OFANeutronAgent(n_rpc.RpcCallback,
             table_id=constants.UCAST_TO_TUN)]
         msg = br.ofparser.OFPFlowMod(br.datapath,
                                      table_id=constants.PATCH_LV_TO_TUN,
+                                     priority=0,
                                      match=match,
                                      instructions=instructions)
         self.ryu_send_msg(msg)
@@ -810,6 +824,7 @@ class OFANeutronAgent(n_rpc.RpcCallback,
             table_id=constants.FLOOD_TO_TUN)]
         msg = br.ofparser.OFPFlowMod(br.datapath,
                                      table_id=constants.PATCH_LV_TO_TUN,
+                                     priority=0,
                                      match=match,
                                      instructions=instructions)
         self.ryu_send_msg(msg)
@@ -879,6 +894,7 @@ class OFANeutronAgent(n_rpc.RpcCallback,
         self.ryu_send_msg(msg)
 
         self._tun_br_sort_incoming_traffic_depend_in_port(self.tun_br)
+        self._tun_br_output_arp_packet_to_controller(self.tun_br)
         self._tun_br_goto_table_ucast_unicast(self.tun_br)
         self._tun_br_goto_table_flood_broad_multi_cast(self.tun_br)
         self._tun_br_set_table_tun_by_tunnel_type(self.tun_br)
@@ -1035,23 +1051,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                     changed_ports.add(port)
         return changed_ports
 
-    def update_ancillary_ports(self, registered_ports):
-        # TODO(yamamoto): stop using ovsdb
-        # - do the same as scan_ports
-        # - or, find a way to update status of ancillary ports differently
-        #   eg. let interface drivers mark ports up
-        ports = set()
-        for bridge in self.ancillary_brs:
-            ports |= bridge.get_vif_port_set()
-
-        if ports == registered_ports:
-            return
-        added = ports - registered_ports
-        removed = registered_ports - ports
-        return {'current': ports,
-                'added': added,
-                'removed': removed}
-
     def treat_vif_port(self, vif_port, port_id, network_id, network_type,
                        physical_network, segmentation_id, admin_state_up):
         if vif_port:
@@ -1070,13 +1069,13 @@ class OFANeutronAgent(n_rpc.RpcCallback,
         else:
             LOG.debug(_("No VIF port for port %s defined on agent."), port_id)
 
-    def _setup_tunnel_port(self, port_name, remote_ip, tunnel_type):
-        ofport = self.tun_br.add_tunnel_port(port_name,
-                                             remote_ip,
-                                             self.local_ip,
-                                             tunnel_type,
-                                             self.vxlan_udp_port,
-                                             self.dont_fragment)
+    def _setup_tunnel_port(self, br, port_name, remote_ip, tunnel_type):
+        ofport = br.add_tunnel_port(port_name,
+                                    remote_ip,
+                                    self.local_ip,
+                                    tunnel_type,
+                                    self.vxlan_udp_port,
+                                    self.dont_fragment)
         ofport_int = -1
         try:
             ofport_int = int(ofport)
@@ -1091,27 +1090,28 @@ class OFANeutronAgent(n_rpc.RpcCallback,
         self.tun_br_ofports[tunnel_type][remote_ip] = ofport
         # Add flow in default table to resubmit to the right
         # tunelling table (lvid will be set in the latter)
-        match = self.tun_br.ofparser.OFPMatch(in_port=int(ofport))
-        instructions = [self.tun_br.ofparser.OFPInstructionGotoTable(
+        match = br.ofparser.OFPMatch(in_port=int(ofport))
+        instructions = [br.ofparser.OFPInstructionGotoTable(
             table_id=constants.TUN_TABLE[tunnel_type])]
-        msg = self.tun_br.ofparser.OFPFlowMod(self.tun_br.datapath,
-                                              priority=1,
-                                              match=match,
-                                              instructions=instructions)
+        msg = br.ofparser.OFPFlowMod(br.datapath,
+                                     priority=1,
+                                     match=match,
+                                     instructions=instructions)
         self.ryu_send_msg(msg)
         return ofport
 
-    def setup_tunnel_port(self, remote_ip, network_type):
+    def setup_tunnel_port(self, br, remote_ip, network_type):
         port_name = self._create_tunnel_port_name(network_type, remote_ip)
         if not port_name:
             return 0
-        ofport = self._setup_tunnel_port(port_name,
+        ofport = self._setup_tunnel_port(br,
+                                         port_name,
                                          remote_ip,
                                          network_type)
         return ofport
 
-    def _remove_tunnel_port(self, tun_ofport, tunnel_type):
-        datapath = self.tun_br.datapath
+    def _remove_tunnel_port(self, br, tun_ofport, tunnel_type):
+        datapath = br.datapath
         ofp = datapath.ofproto
         ofpp = datapath.ofproto_parser
         for remote_ip, ofport in self.tun_br_ofports[tunnel_type].items():
@@ -1119,7 +1119,7 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                 port_name = self._create_tunnel_port_name(tunnel_type,
                                                           remote_ip)
                 if port_name:
-                    self.tun_br.delete_port(port_name)
+                    br.delete_port(port_name)
                 match = ofpp.OFPMatch(in_port=int(ofport))
                 msg = ofpp.OFPFlowMod(datapath,
                                       command=ofp.OFPFC_DELETE,
@@ -1129,14 +1129,14 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                 self.ryu_send_msg(msg)
                 self.tun_br_ofports[tunnel_type].pop(remote_ip, None)
 
-    def cleanup_tunnel_port(self, tun_ofport, tunnel_type):
+    def cleanup_tunnel_port(self, br, tun_ofport, tunnel_type):
         # Check if this tunnel port is still used
         for lvm in self.local_vlan_map.values():
             if tun_ofport in lvm.tun_ofports:
                 break
         # If not, remove it
         else:
-            self._remove_tunnel_port(tun_ofport, tunnel_type)
+            self._remove_tunnel_port(br, tun_ofport, tunnel_type)
 
     def treat_devices_added_or_updated(self, devices):
         resync = False
@@ -1188,27 +1188,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                     self.port_dead(port)
         return resync
 
-    def treat_ancillary_devices_added(self, devices):
-        resync = False
-        for device in devices:
-            LOG.info(_("Ancillary Port %s added"), device)
-            try:
-                self.plugin_rpc.get_device_details(self.context, device,
-                                                   self.agent_id)
-            except Exception as e:
-                LOG.debug(_("Unable to get port details for "
-                            "%(device)s: %(e)s"),
-                          {'device': device, 'e': e})
-                resync = True
-                continue
-
-            # update plugin about port status
-            self.plugin_rpc.update_device_up(self.context,
-                                             device,
-                                             self.agent_id,
-                                             cfg.CONF.host)
-        return resync
-
     def treat_devices_removed(self, devices):
         resync = False
         self.sg_agent.remove_devices_filter(devices)
@@ -1225,27 +1204,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                 resync = True
                 continue
             self.port_unbound(device)
-        return resync
-
-    def treat_ancillary_devices_removed(self, devices):
-        resync = False
-        for device in devices:
-            LOG.info(_("Attachment %s removed"), device)
-            try:
-                details = self.plugin_rpc.update_device_down(self.context,
-                                                             device,
-                                                             self.agent_id,
-                                                             cfg.CONF.host)
-            except Exception as e:
-                LOG.debug(_("port_removed failed for %(device)s: %(e)s"),
-                          {'device': device, 'e': e})
-                resync = True
-                continue
-            if details['exists']:
-                LOG.info(_("Port %s updated."), device)
-                # Nothing to do regarding local networking
-            else:
-                LOG.debug(_("Device %s not defined on plugin"), device)
         return resync
 
     def process_network_ports(self, port_info):
@@ -1281,30 +1239,6 @@ class OFANeutronAgent(n_rpc.RpcCallback,
         # If one of the above opertaions fails => resync with plugin
         return (resync_add | resync_removed)
 
-    def process_ancillary_network_ports(self, port_info):
-        resync_add = False
-        resync_removed = False
-        if 'added' in port_info:
-            start = time.time()
-            resync_add = self.treat_ancillary_devices_added(port_info['added'])
-            LOG.debug(_("process_ancillary_network_ports - iteration: "
-                        "%(iter_num)d - treat_ancillary_devices_added "
-                        "completed in %(elapsed).3f"),
-                      {'iter_num': self.iter_num,
-                       'elapsed': time.time() - start})
-        if 'removed' in port_info:
-            start = time.time()
-            resync_removed = self.treat_ancillary_devices_removed(
-                port_info['removed'])
-            LOG.debug(_("process_ancillary_network_ports - iteration: "
-                        "%(iter_num)d - treat_ancillary_devices_removed "
-                        "completed in %(elapsed).3f"),
-                      {'iter_num': self.iter_num,
-                       'elapsed': time.time() - start})
-
-        # If one of the above opertaions fails => resync with plugin
-        return (resync_add | resync_removed)
-
     def tunnel_sync(self):
         resync = False
         try:
@@ -1318,38 +1252,27 @@ class OFANeutronAgent(n_rpc.RpcCallback,
             resync = True
         return resync
 
-    def _agent_has_updates(self, polling_manager):
-        return (polling_manager.is_polling_required or
-                self.updated_ports or
-                self.sg_agent.firewall_refresh_needed())
-
     def _port_info_has_changes(self, port_info):
         return (port_info.get('added') or
                 port_info.get('removed') or
                 port_info.get('updated'))
 
-    def ovsdb_monitor_loop(self, polling_manager=None):
-        if not polling_manager:
-            polling_manager = polling.AlwaysPoll()
+    def daemon_loop(self):
+        # TODO(yamamoto):
+        # It might be better to monitor port status async messages
 
         sync = True
         ports = set()
-        updated_ports_copy = set()
-        ancillary_ports = set()
         tunnel_sync = True
         while True:
             start = time.time()
-            port_stats = {'regular': {'added': 0, 'updated': 0, 'removed': 0},
-                          'ancillary': {'added': 0, 'removed': 0}}
-            LOG.debug(_("Agent ovsdb_monitor_loop - "
-                      "iteration:%d started"),
+            port_stats = {'regular': {'added': 0, 'updated': 0, 'removed': 0}}
+            LOG.debug("Agent daemon_loop - iteration:%d started",
                       self.iter_num)
             if sync:
                 LOG.info(_("Agent out of sync with plugin!"))
                 ports.clear()
-                ancillary_ports.clear()
                 sync = False
-                polling_manager.force_polling()
             # Notify the plugin of tunnel IP
             if self.enable_tunneling and tunnel_sync:
                 LOG.info(_("Agent tunnel out of sync with plugin!"))
@@ -1358,107 +1281,65 @@ class OFANeutronAgent(n_rpc.RpcCallback,
                 except Exception:
                     LOG.exception(_("Error while synchronizing tunnels"))
                     tunnel_sync = True
-            if self._agent_has_updates(polling_manager):
-                try:
-                    LOG.debug(_("Agent ovsdb_monitor_loop - "
-                                "iteration:%(iter_num)d - "
-                                "starting polling. Elapsed:%(elapsed).3f"),
+            LOG.debug("Agent daemon_loop - iteration:%(iter_num)d - "
+                      "starting polling. Elapsed:%(elapsed).3f",
+                      {'iter_num': self.iter_num,
+                       'elapsed': time.time() - start})
+            try:
+                # Save updated ports dict to perform rollback in
+                # case resync would be needed, and then clear
+                # self.updated_ports. As the greenthread should not yield
+                # between these two statements, this will be thread-safe
+                updated_ports_copy = self.updated_ports
+                self.updated_ports = set()
+                port_info = self.scan_ports(ports, updated_ports_copy)
+                ports = port_info['current']
+                LOG.debug("Agent daemon_loop - iteration:%(iter_num)d - "
+                          "port information retrieved. "
+                          "Elapsed:%(elapsed).3f",
+                          {'iter_num': self.iter_num,
+                           'elapsed': time.time() - start})
+                # Secure and wire/unwire VIFs and update their status
+                # on Neutron server
+                if (self._port_info_has_changes(port_info) or
+                    self.sg_agent.firewall_refresh_needed()):
+                    LOG.debug("Starting to process devices in:%s",
+                              port_info)
+                    # If treat devices fails - must resync with plugin
+                    sync = self.process_network_ports(port_info)
+                    LOG.debug("Agent daemon_loop - "
+                              "iteration:%(iter_num)d - "
+                              "ports processed. Elapsed:%(elapsed).3f",
                               {'iter_num': self.iter_num,
                                'elapsed': time.time() - start})
-                    # Save updated ports dict to perform rollback in
-                    # case resync would be needed, and then clear
-                    # self.updated_ports. As the greenthread should not yield
-                    # between these two statements, this will be thread-safe
-                    updated_ports_copy = self.updated_ports
-                    self.updated_ports = set()
-                    port_info = self.scan_ports(ports, updated_ports_copy)
-                    ports = port_info['current']
-                    LOG.debug(_("Agent ovsdb_monitor_loop - "
-                                "iteration:%(iter_num)d - "
-                                "port information retrieved. "
-                                "Elapsed:%(elapsed).3f"),
-                              {'iter_num': self.iter_num,
-                               'elapsed': time.time() - start})
-                    # Secure and wire/unwire VIFs and update their status
-                    # on Neutron server
-                    if (self._port_info_has_changes(port_info) or
-                        self.sg_agent.firewall_refresh_needed()):
-                        LOG.debug(_("Starting to process devices in:%s"),
-                                  port_info)
-                        # If treat devices fails - must resync with plugin
-                        sync = self.process_network_ports(port_info)
-                        LOG.debug(_("Agent ovsdb_monitor_loop - "
-                                    "iteration:%(iter_num)d - "
-                                    "ports processed. Elapsed:%(elapsed).3f"),
-                                  {'iter_num': self.iter_num,
-                                   'elapsed': time.time() - start})
-                        port_stats['regular']['added'] = (
-                            len(port_info.get('added', [])))
-                        port_stats['regular']['updated'] = (
-                            len(port_info.get('updated', [])))
-                        port_stats['regular']['removed'] = (
-                            len(port_info.get('removed', [])))
-                    # Treat ancillary devices if they exist
-                    if self.ancillary_brs:
-                        port_info = self.update_ancillary_ports(
-                            ancillary_ports)
-                        LOG.debug(_("Agent ovsdb_monitor_loop - "
-                                    "iteration:%(iter_num)d - "
-                                    "ancillary port info retrieved. "
-                                    "Elapsed:%(elapsed).3f"),
-                                  {'iter_num': self.iter_num,
-                                   'elapsed': time.time() - start})
-
-                        if port_info:
-                            rc = self.process_ancillary_network_ports(
-                                port_info)
-                            LOG.debug(_("Agent ovsdb_monitor_loop - "
-                                        "iteration:"
-                                        "%(iter_num)d - ancillary ports "
-                                        "processed. Elapsed:%(elapsed).3f"),
-                                      {'iter_num': self.iter_num,
-                                       'elapsed': time.time() - start})
-                            ancillary_ports = port_info['current']
-                            port_stats['ancillary']['added'] = (
-                                len(port_info.get('added', [])))
-                            port_stats['ancillary']['removed'] = (
-                                len(port_info.get('removed', [])))
-                            sync = sync | rc
-
-                    polling_manager.polling_completed()
-                except Exception:
-                    LOG.exception(_("Error while processing VIF ports"))
-                    # Put the ports back in self.updated_port
-                    self.updated_ports |= updated_ports_copy
-                    sync = True
+                    port_stats['regular']['added'] = (
+                        len(port_info.get('added', [])))
+                    port_stats['regular']['updated'] = (
+                        len(port_info.get('updated', [])))
+                    port_stats['regular']['removed'] = (
+                        len(port_info.get('removed', [])))
+            except Exception:
+                LOG.exception(_("Error while processing VIF ports"))
+                # Put the ports back in self.updated_port
+                self.updated_ports |= updated_ports_copy
+                sync = True
 
             # sleep till end of polling interval
             elapsed = (time.time() - start)
-            LOG.debug(_("Agent ovsdb_monitor_loop - iteration:%(iter_num)d "
-                        "completed. Processed ports statistics:"
-                        "%(port_stats)s. Elapsed:%(elapsed).3f"),
+            LOG.debug("Agent daemon_loop - iteration:%(iter_num)d "
+                      "completed. Processed ports statistics:"
+                      "%(port_stats)s. Elapsed:%(elapsed).3f",
                       {'iter_num': self.iter_num,
                        'port_stats': port_stats,
                        'elapsed': elapsed})
             if (elapsed < self.polling_interval):
                 time.sleep(self.polling_interval - elapsed)
             else:
-                LOG.debug(_("Loop iteration exceeded interval "
-                            "(%(polling_interval)s vs. %(elapsed)s)!"),
+                LOG.debug("Loop iteration exceeded interval "
+                          "(%(polling_interval)s vs. %(elapsed)s)!",
                           {'polling_interval': self.polling_interval,
                            'elapsed': elapsed})
             self.iter_num = self.iter_num + 1
-
-    def daemon_loop(self):
-        # TODO(yamamoto): make polling logic stop using ovsdb monitor
-        # - make it a dumb periodic polling
-        # - or, monitor port status async messages
-        with polling.get_polling_manager(
-                self.minimize_polling,
-                self.root_helper,
-                self.ovsdb_monitor_respawn_interval) as pm:
-
-            self.ovsdb_monitor_loop(polling_manager=pm)
 
 
 def create_agent_config_map(config):
@@ -1479,10 +1360,8 @@ def create_agent_config_map(config):
         bridge_mappings=bridge_mappings,
         root_helper=config.AGENT.root_helper,
         polling_interval=config.AGENT.polling_interval,
-        minimize_polling=config.AGENT.minimize_polling,
         tunnel_types=config.AGENT.tunnel_types,
         veth_mtu=config.AGENT.veth_mtu,
-        ovsdb_monitor_respawn_interval=constants.DEFAULT_OVSDBMON_RESPAWN,
     )
 
     # If enable_tunneling is TRUE, set tunnel_type to default to GRE

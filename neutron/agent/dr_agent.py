@@ -1,4 +1,4 @@
-# Copyright 2012 VMware, Inc.  All rights reserved.
+# Copyright 2014 Midokrua SARL.  All rights reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,9 +13,11 @@
 #    under the License.
 #
 # @author: Jaume Devesa, devvesa@gmail.com, Midokura SARL
+import socket
 import sys
 
 from oslo.config import cfg
+from ryu.services.protocols.bgp import bgpspeaker
 
 from neutron.agent.common import config
 from neutron.agent.linux import external_process
@@ -26,11 +28,13 @@ from neutron.common import rpc as n_rpc
 from neutron.common import topics
 from neutron import context
 from neutron import manager
+from neutron.openstack.common import importutils
 from neutron.openstack.common import log as logging
 from neutron.openstack.common import loopingcall
 from neutron.openstack.common import periodic_task
 from neutron.openstack.common import service
 from neutron import service as neutron_service
+
 
 LOG = logging.getLogger(__name__)
 
@@ -67,10 +71,23 @@ class DRAgentPluginApi(n_rpc.RpcProxy):
                          topic=self.topic)
 
 
-class DRAgent(manager.Manager):
-    """Manager for Dynamic Routing. """
+def dump_remote_best_path_change(event):
+    Log.debug('the best path changed:', event.remote_as, event.prefix,
+              event.nexthop, event.is_withdraw)
 
-    OPTS = []
+
+class DRAgent(manager.Manager):
+    """Manager for Dynamic Routing."""
+
+    OPTS = [
+        cfg.StrOpt(
+            'bgp_speaker_driver',
+            default='neutron.agent.linux.bgp.RyuBGPDriver',
+            help=_('Class of BGP speaker to be instantiated.')),
+        cfg.IntOpt(
+            'local_as_number',
+            help=_('AS number of the host where this agent runs.')),
+    ]
     RPC_API_VERSION = '1.1'
 
     def __init__(self, host, conf=None):
@@ -79,17 +96,35 @@ class DRAgent(manager.Manager):
         self.fullsync = True
         self.peers = set()
         self.advertise_networks = set()
+        self.driver = importutils.import_object(
+            cfg.CONF.bgp_speaker_driver,
+            cfg.CONF.local_as_number,
+            # FIXME(tfukushima): It's better to use Neutron API here.
+            socket.gethostbyname(socket.gethostname()),
+            best_path_change_handler=dump_remote_best_path_change)
         super(DRAgent, self).__init__()
 
-    def add_routingpeer(self, context, payload):
-        #TODO(tfukushima): implement this call using the Ryu's BGP speaker
-        #                  driver
-        pass
+    def add_routingpeer(self, context, routing_peer):
+        """Add a new routing peer.
 
-    def remove_routingpeer(self, context, payload):
-        #TODO(tfukushima): implement this call using the Ryu's BGP speaker
-        #                  driver
-        pass
+        :param context: an instance of neutron.context
+        :param routing_peer: a dictionary of the peer ID and its AS number
+        """
+        peer_id = routing_peer['peer']
+        peer_as = routing_peer['remote_as']
+        password = routing_peer['password'] or None  # Forbid empty passwords
+        self.driver.add_peer(peer_id, peer_as, password=password)
+        self.peers.add(peer_id)
+
+    def remove_routingpeer(self, context, routing_peer):
+        """Remove the given routing peer.
+
+        :param context: an instance of neutron.context
+        :param routing_peer: a dictionary of the peer ID and its AS number
+        """
+        peer_id = routing_peer['peer']
+        self.driver.del_peer(peer_id)
+        self.peers.remove(peer_id)
 
     @periodic_task.periodic_task
     def periodic_sync_peers_task(self, context):
@@ -108,6 +143,8 @@ class DRAgent(manager.Manager):
         # self.peers and self.advertise_networks. For any doubt, please check
         # out the module neutron.agent.l3_agent. Is quite similar (but more
         # complex) that we want to do.
+        self.peers.update(peers)
+        self.advertise_networks.update(networks)
 
 
 class DRAgentWithStateReport(DRAgent):
@@ -142,16 +179,17 @@ class DRAgentWithStateReport(DRAgent):
 
 
 def main(manager='neutron.agent.dr_agent.DRAgentWithStateReport'):
-    conf = cfg.CONF
-    conf.register_opts(DRAgentWithStateReport.OPTS)
-    config.register_agent_state_opts_helper(conf)
-    config.register_root_helper(conf)
-    conf.register_opts(external_process.OPTS)
+    cfg.CONF.register_opts(DRAgentWithStateReport.OPTS)
+    config.register_agent_state_opts_helper(cfg.CONF)
+    config.register_root_helper(cfg.CONF)
+    cfg.CONF.register_opts(external_process.OPTS)
+
     common_config.init(sys.argv[1:])
-    config.setup_logging(conf)
-    server = neutron_service.Service.create(
+    config.setup_logging(cfg.CONF)
+
+    svc = neutron_service.Service.create(
         binary='neutron-dr-agent',
         topic=topics.DR_AGENT,
         report_interval=cfg.CONF.AGENT.report_interval,
         manager=manager)
-    service.launch(server).wait()
+    service.launch(svc).wait()

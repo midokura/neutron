@@ -82,6 +82,7 @@ class L3PluginApi(n_rpc.RpcProxy):
               - get_ports_by_subnet
               - get_agent_gateway_port
               Needed by the agent when operating in DVR/DVR_SNAT mode
+        1.3 - Get the list of activated services
 
     """
 
@@ -96,8 +97,7 @@ class L3PluginApi(n_rpc.RpcProxy):
         """Make a remote process call to retrieve the sync data for routers."""
         return self.call(context,
                          self.make_msg('sync_routers', host=self.host,
-                                       router_ids=router_ids),
-                         topic=self.topic)
+                                       router_ids=router_ids))
 
     def get_external_network_id(self, context):
         """Make a remote process call to retrieve the external network id.
@@ -108,8 +108,7 @@ class L3PluginApi(n_rpc.RpcProxy):
         """
         return self.call(context,
                          self.make_msg('get_external_network_id',
-                                       host=self.host),
-                         topic=self.topic)
+                                       host=self.host))
 
     def update_floatingip_statuses(self, context, router_id, fip_statuses):
         """Call the plugin update floating IPs's operational status."""
@@ -117,7 +116,6 @@ class L3PluginApi(n_rpc.RpcProxy):
                          self.make_msg('update_floatingip_statuses',
                                        router_id=router_id,
                                        fip_statuses=fip_statuses),
-                         topic=self.topic,
                          version='1.1')
 
     def get_ports_by_subnet(self, context, subnet_id):
@@ -135,6 +133,13 @@ class L3PluginApi(n_rpc.RpcProxy):
                                        network_id=fip_net, host=self.host),
                          topic=self.topic,
                          version='1.2')
+
+    def get_service_plugin_list(self, context):
+        """Make a call to get the list of activated services."""
+        return self.call(context,
+                         self.make_msg('get_service_plugin_list'),
+                         topic=self.topic,
+                         version='1.3')
 
 
 class RouterInfo(object):
@@ -420,6 +425,9 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         self.removed_routers = set()
         self.sync_progress = False
 
+        # Get the list of service plugins from Neutron Server
+        self.neutron_service_plugins = (
+            self.plugin_rpc.get_service_plugin_list(self.context))
         self._clean_stale_namespaces = self.conf.use_namespaces
 
         # dvr data
@@ -752,9 +760,6 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                                namespace=ri.ns_name,
                                prefix=INTERNAL_DEV_PREFIX)
 
-        # Get IPv4 only internal CIDRs
-        internal_cidrs = [p['ip_cidr'] for p in ri.internal_ports
-                          if netaddr.IPNetwork(p['ip_cidr']).version == 4]
         # TODO(salv-orlando): RouterInfo would be a better place for
         # this logic too
         ex_gw_port_id = (ex_gw_port and ex_gw_port['id'] or
@@ -765,11 +770,9 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             interface_name = self.get_external_device_name(ex_gw_port_id)
         if ex_gw_port and ex_gw_port != ri.ex_gw_port:
             self._set_subnet_info(ex_gw_port)
-            self.external_gateway_added(ri, ex_gw_port,
-                                        interface_name, internal_cidrs)
+            self.external_gateway_added(ri, ex_gw_port, interface_name)
         elif not ex_gw_port and ri.ex_gw_port:
-            self.external_gateway_removed(ri, ri.ex_gw_port,
-                                          interface_name, internal_cidrs)
+            self.external_gateway_removed(ri, ri.ex_gw_port, interface_name)
 
         stale_devs = [dev for dev in existing_devices
                       if dev.startswith(EXTERNAL_DEV_PREFIX)
@@ -787,6 +790,9 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         # Process SNAT rules for external gateway
         if (not ri.router['distributed'] or
             ex_gw_port and ri.router['gw_port_host'] == self.host):
+            # Get IPv4 only internal CIDRs
+            internal_cidrs = [p['ip_cidr'] for p in ri.internal_ports
+                              if netaddr.IPNetwork(p['ip_cidr']).version == 4]
             ri.perform_snat_action(self._handle_router_snat_rules,
                                    internal_cidrs, interface_name)
 
@@ -1055,7 +1061,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             LOG.error(_('DVR: no map match_port found!'))
 
     def _create_dvr_gateway(self, ri, ex_gw_port, gw_interface_name,
-                            internal_cidrs, snat_ports):
+                            snat_ports):
         """Create SNAT namespace."""
         snat_ns_name = self.get_snat_ns_name(ri.router['id'])
         self._create_namespace(snat_ns_name)
@@ -1069,16 +1075,14 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                                          port['mac_address'], interface_name,
                                          SNAT_INT_DEV_PREFIX)
         self._external_gateway_added(ri, ex_gw_port, gw_interface_name,
-                                     internal_cidrs, snat_ns_name,
-                                     preserve_ips=[])
+                                     snat_ns_name, preserve_ips=[])
         ri.snat_iptables_manager = (
             iptables_manager.IptablesManager(
                 root_helper=self.root_helper, namespace=snat_ns_name
             )
         )
 
-    def external_gateway_added(self, ri, ex_gw_port,
-                               interface_name, internal_cidrs):
+    def external_gateway_added(self, ri, ex_gw_port, interface_name):
         if ri.router['distributed']:
             ip_wrapr = ip_lib.IPWrapper(self.root_helper, namespace=ri.ns_name)
             ip_wrapr.netns.execute(['sysctl', '-w',
@@ -1094,9 +1098,8 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
             if self.conf.agent_mode == 'dvr_snat' and (
                     ri.router['gw_port_host'] == self.host):
                 if snat_ports:
-                    self._create_dvr_gateway(ri, ex_gw_port,
-                                             interface_name,
-                                             internal_cidrs, snat_ports)
+                    self._create_dvr_gateway(ri, ex_gw_port, interface_name,
+                                             snat_ports)
             for port in snat_ports:
                 for ip in port['fixed_ips']:
                     self._update_arp_entry(ri, ip['ip_address'],
@@ -1112,11 +1115,10 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
                         for ip in floating_ips]
 
         self._external_gateway_added(ri, ex_gw_port, interface_name,
-                                     internal_cidrs, ri.ns_name,
-                                     preserve_ips)
+                                     ri.ns_name, preserve_ips)
 
     def _external_gateway_added(self, ri, ex_gw_port, interface_name,
-                                internal_cidrs, ns_name, preserve_ips):
+                                ns_name, preserve_ips):
         if not ip_lib.device_exists(interface_name,
                                     root_helper=self.root_helper,
                                     namespace=ns_name):
@@ -1170,8 +1172,7 @@ class L3NATAgent(firewall_l3_agent.FWaaSL3AgentRpcCallback, manager.Manager):
         ip_wrapper.netns.execute(['ip', 'addr', 'add',
                                   ip_cidr, 'dev', interface_name])
 
-    def external_gateway_removed(self, ri, ex_gw_port,
-                                 interface_name, internal_cidrs):
+    def external_gateway_removed(self, ri, ex_gw_port, interface_name):
         if ri.router['distributed']:
             for p in ri.internal_ports:
                 internal_interface = self.get_internal_device_name(p['id'])

@@ -247,7 +247,7 @@ class TestBasicRouterOperations(base.BaseTestCase):
         self.l3pluginApi_cls_p = mock.patch(
             'neutron.agent.l3_agent.L3PluginApi')
         l3pluginApi_cls = self.l3pluginApi_cls_p.start()
-        self.plugin_api = mock.Mock()
+        self.plugin_api = mock.MagicMock()
         l3pluginApi_cls.return_value = self.plugin_api
 
         self.looping_call_p = mock.patch(
@@ -337,7 +337,6 @@ class TestBasicRouterOperations(base.BaseTestCase):
         ri = l3_agent.RouterInfo(router['id'], self.conf.root_helper,
                                  self.conf.use_namespaces, router=router)
         agent = l3_agent.L3NATAgent(HOSTNAME, self.conf)
-        internal_cidrs = ['100.0.1.0/24', '200.74.0.0/16']
         ex_gw_port = {'fixed_ips': [{'ip_address': '20.0.0.30',
                                      'subnet_id': _uuid()}],
                       'subnet': {'gateway_ip': '20.0.0.1'},
@@ -355,8 +354,7 @@ class TestBasicRouterOperations(base.BaseTestCase):
                                          'fixed_ip_address': '192.168.0.1',
                                          'port_id': _uuid()}]}
             router[l3_constants.FLOATINGIP_KEY] = fake_fip['floatingips']
-            agent.external_gateway_added(ri, ex_gw_port,
-                                         interface_name, internal_cidrs)
+            agent.external_gateway_added(ri, ex_gw_port, interface_name)
             self.assertEqual(self.mock_driver.plug.call_count, 1)
             self.assertEqual(self.mock_driver.init_l3.call_count, 1)
             self.send_arp.assert_called_once_with(ri.ns_name, interface_name,
@@ -371,8 +369,7 @@ class TestBasicRouterOperations(base.BaseTestCase):
 
         elif action == 'remove':
             self.device_exists.return_value = True
-            agent.external_gateway_removed(ri, ex_gw_port,
-                                           interface_name, internal_cidrs)
+            agent.external_gateway_removed(ri, ex_gw_port, interface_name)
             self.assertEqual(self.mock_driver.unplug.call_count, 1)
         else:
             raise Exception("Invalid action %s" % action)
@@ -1129,7 +1126,7 @@ class TestBasicRouterOperations(base.BaseTestCase):
                 l3_agent.L3NATAgent,
                 'internal_network_added') as internal_network_added:
             # raise RuntimeError to simulate that an unexpected exception
-            # occurrs
+            # occurs
             internal_network_added.side_effect = RuntimeError
             self.assertRaises(RuntimeError, agent.process_router, ri)
             self.assertNotIn(
@@ -1158,7 +1155,7 @@ class TestBasicRouterOperations(base.BaseTestCase):
                 l3_agent.L3NATAgent,
                 'internal_network_removed') as internal_net_removed:
             # raise RuntimeError to simulate that an unexpected exception
-            # occurrs
+            # occurs
             internal_net_removed.side_effect = RuntimeError
             ri.internal_ports[0]['admin_state_up'] = False
             # The above port is set to down state, remove it.
@@ -1716,11 +1713,9 @@ class TestBasicRouterOperations(base.BaseTestCase):
                        'id': _uuid(), 'device_id': _uuid()}]
 
         interface_name = agent.get_snat_int_device_name(port_id)
-        internal_cidrs = None
         self.device_exists.return_value = False
 
-        agent._create_dvr_gateway(ri, dvr_gw_port, interface_name,
-                                  internal_cidrs, snat_ports)
+        agent._create_dvr_gateway(ri, dvr_gw_port, interface_name, snat_ports)
 
         # check 2 internal ports are plugged
         # check 1 ext-gw-port is plugged
@@ -1864,7 +1859,7 @@ class TestL3AgentEventHandler(base.BaseTestCase):
         l3_plugin_p = mock.patch(
             'neutron.agent.l3_agent.L3PluginApi')
         l3_plugin_cls = l3_plugin_p.start()
-        l3_plugin_cls.return_value = mock.Mock()
+        l3_plugin_cls.return_value = mock.MagicMock()
 
         self.external_process_p = mock.patch(
             'neutron.agent.linux.external_process.ProcessManager'
