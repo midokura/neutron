@@ -57,10 +57,10 @@ class LinuxBGPDriver(object):
 class RyuBGPDriver(LinuxBGPDriver):
     """BGP driver with Ryu's BGPSpeaker."""
 
-    self __init__(self, as_number, router_id,
-                  best_path_change_handler=None):
+    def __init__(self, as_number, router_id,
+                 best_path_change_handler=None):
         try:
-            from ryu.serivces.protocols.bgp import bgpspeaker
+            from ryu.services.protocols.bgp import bgpspeaker
         except ImportError as e:
             msg = _("Error importing BGP driver: '%s'") % e
             LOG.error(msg)
