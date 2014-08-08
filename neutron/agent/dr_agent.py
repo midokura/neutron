@@ -14,7 +14,6 @@
 #
 # @author: Jaume Devesa, devvesa@gmail.com, Midokura SARL
 
-import socket
 import sys
 
 from oslo.config import cfg
@@ -87,6 +86,11 @@ class DRAgent(manager.Manager):
         cfg.IntOpt(
             'local_as_number',
             help=_('AS number of the host where this agent runs.')),
+        cfg.StrOpt(
+            'router_id',
+            help=_('The BGP identifier, which MUST be the IPv4 address of the '
+                   'node where the dynamic routing agent holds the BGP '
+                   'speaker lives.')),
     ]
     RPC_API_VERSION = '1.1'
 
@@ -99,8 +103,7 @@ class DRAgent(manager.Manager):
         self.driver = importutils.import_object(
             cfg.CONF.bgp_speaker_driver,
             cfg.CONF.local_as_number,
-            # FIXME(tfukushima): It's better to use Neutron API here.
-            socket.gethostbyname(socket.gethostname()),
+            cfg.CONF.router_id,
             best_path_change_handler=dump_remote_best_path_change)
         super(DRAgent, self).__init__()
 
