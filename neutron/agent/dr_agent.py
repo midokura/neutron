@@ -81,7 +81,7 @@ class DRAgent(manager.Manager):
     OPTS = [
         cfg.StrOpt(
             'bgp_speaker_driver',
-            default='neutron.agent.linux.bgp.RyuBGPDriver',
+            default='neutron.agent.linux.bgp.ryu_driver.RyuBGPDriver',
             help=_('Class of BGP speaker to be instantiated.')),
         cfg.IntOpt(
             'local_as_number',
@@ -93,6 +93,9 @@ class DRAgent(manager.Manager):
                    'speaker lives.')),
     ]
     RPC_API_VERSION = '1.1'
+    # This class should be set after the configuration file is loaded
+    # explicitly.
+    BGP_DRIVER_CLASS = None
 
     def __init__(self, host, conf=None):
         self.context = context.get_admin_context_without_session()
@@ -100,8 +103,7 @@ class DRAgent(manager.Manager):
         self.fullsync = True
         self.peers = set()
         self.advertise_networks = set()
-        self.driver = importutils.import_object(
-            cfg.CONF.bgp_speaker_driver,
+        self.driver = self.__class__.BGP_DRIVER_CLASS(
             cfg.CONF.local_as_number,
             cfg.CONF.router_id,
             best_path_change_handler=dump_remote_best_path_change)
@@ -186,6 +188,10 @@ def main(manager='neutron.agent.dr_agent.DRAgentWithStateReport'):
     config.register_agent_state_opts_helper(cfg.CONF)
     config.register_root_helper(cfg.CONF)
     cfg.CONF.register_opts(external_process.OPTS)
+
+    # Configure the BGP speaker driver based on the setting in dr_agent.ini.
+    DRAgentWithStateReport.BGP_DRIVER_CLASS = importutils.import_class(
+        cfg.CONF.bgp_speaker_driver)
 
     common_config.init(sys.argv[1:])
     config.setup_logging(cfg.CONF)

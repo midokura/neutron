@@ -11,60 +11,21 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-#
 
-import abc
+from ryu.services.protocols.bgp import bgpspeaker
 
-import six
-
+from neutron.agent.linux.bgp import base
 from neutron.openstack.common import log as logging
 
 
 LOG = logging.getLogger(__name__)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class LinuxBGPDriver(object):
-    """Base class for the BGP drivers.
-
-    Every class provides the fetures of the BGP speakers should extend this
-    base class.
-    """
-    def __init__(self, as_number, router_id,
-                 best_path_change_handler=None):
-        self.as_number = as_number
-        self.router_id = router_id
-        self.best_path_change_handler = best_path_change_handler
-
-    @abc.abstractmethod
-    def add_peer(self, peer_id, peer_as, password=None):
-        """Add a new routing peer.
-
-        :param peer_id: the peer ID
-        :param peer_as: AS number of the peer
-        :param password: the password used for securing sessions; defaults to
-            None
-        """
-
-    @abc.abstractmethod
-    def del_peer(self, peer_id):
-        """Delete a routing peer associated with the given peer ID
-
-        :param peer_id: the peer ID
-        """
-
-
-class RyuBGPDriver(LinuxBGPDriver):
+class RyuBGPDriver(base.LinuxBGPDriver):
     """BGP driver with Ryu's BGPSpeaker."""
 
     def __init__(self, as_number, router_id,
                  best_path_change_handler=None):
-        try:
-            from ryu.services.protocols.bgp import bgpspeaker
-        except ImportError as e:
-            msg = _("Error importing BGP driver: '%s'") % e
-            LOG.error(msg)
-            raise SystemExit(1)
         self.bgp_speaker = bgpspeaker.BGPSpeaker(
             as_number, router_id,
             best_path_change_handler=best_path_change_handler)
