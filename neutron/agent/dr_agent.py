@@ -143,8 +143,8 @@ class DRAgent(manager.Manager):
         # self.peers and self.advertise_networks. For any doubt, please check
         # out the module neutron.agent.l3_agent. Is quite similar (but more
         # complex) that we want to do.
-        self.peers.update(peers)
-        self.advertise_networks.update(networks)
+        # self.peers.update(peers)
+        # self.advertise_networks.update(networks)
 
 
 class DRAgentWithStateReport(DRAgent):
