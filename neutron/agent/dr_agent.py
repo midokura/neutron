@@ -72,7 +72,7 @@ class DRAgentPluginApi(n_rpc.RpcProxy):
 
 
 def dump_remote_best_path_change(event):
-    Log.debug('the best path changed:', event.remote_as, event.prefix,
+    LOG.debug(_('the best path changed:'), event.remote_as, event.prefix,
               event.nexthop, event.is_withdraw)
 
 
