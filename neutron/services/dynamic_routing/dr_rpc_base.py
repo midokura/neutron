@@ -34,7 +34,7 @@ class DynamicRoutingRpcCallbackMixin(object):
                         'to dr agent with empty routingpeer dictionary.'))
             return {}
         elif utils.is_extension_supported(
-                dr_plugin, constants.DR_AGENT_SCHEDULER):
+                dr_plugin, constants.DR_AGENT_SCHEDULER_EXT_ALIAS):
             if cfg.CONF.dynamic_routing_auto_schedule:
                 dr_plugin.auto_schedule_routingpeers(context, host)
 
@@ -53,7 +53,7 @@ class DynamicRoutingRpcCallbackMixin(object):
                         'to dr agent with empty routingpeer dictionary.'))
             return {}
         elif utils.is_extension_supported(
-                dr_plugin, constants.DR_AGENT_SCHEDULER):
+                dr_plugin, constants.DR_AGENT_SCHEDULER_EXT_ALIAS):
             if cfg.CONF.dynamic_routing_auto_schedule:
                 dr_plugin.auto_schedule_routinginstances(context, host)
 
