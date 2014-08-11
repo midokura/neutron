@@ -13,11 +13,10 @@
 #    under the License.
 #
 # @author: Jaume Devesa, devvesa@gmail.com, Midokura SARL
-import socket
+
 import sys
 
 from oslo.config import cfg
-from ryu.services.protocols.bgp import bgpspeaker
 
 from neutron.agent.common import config
 from neutron.agent.linux import external_process
@@ -72,7 +71,7 @@ class DRAgentPluginApi(n_rpc.RpcProxy):
 
 
 def dump_remote_best_path_change(event):
-    Log.debug('the best path changed:', event.remote_as, event.prefix,
+    LOG.debug(_('the best path changed:'), event.remote_as, event.prefix,
               event.nexthop, event.is_withdraw)
 
 
@@ -82,13 +81,21 @@ class DRAgent(manager.Manager):
     OPTS = [
         cfg.StrOpt(
             'bgp_speaker_driver',
-            default='neutron.agent.linux.bgp.RyuBGPDriver',
+            default='neutron.agent.linux.bgp.ryu_driver.RyuBGPDriver',
             help=_('Class of BGP speaker to be instantiated.')),
         cfg.IntOpt(
             'local_as_number',
             help=_('AS number of the host where this agent runs.')),
+        cfg.StrOpt(
+            'router_id',
+            help=_('The BGP identifier, which MUST be the IPv4 address of the '
+                   'node where the dynamic routing agent holds the BGP '
+                   'speaker lives.')),
     ]
     RPC_API_VERSION = '1.1'
+    # This class should be set after the configuration file is loaded
+    # explicitly.
+    BGP_DRIVER_CLASS = None
 
     def __init__(self, host, conf=None):
         self.context = context.get_admin_context_without_session()
@@ -96,11 +103,9 @@ class DRAgent(manager.Manager):
         self.fullsync = True
         self.peers = set()
         self.advertise_networks = set()
-        self.driver = importutils.import_object(
-            cfg.CONF.bgp_speaker_driver,
+        self.driver = self.__class__.BGP_DRIVER_CLASS(
             cfg.CONF.local_as_number,
-            # FIXME(tfukushima): It's better to use Neutron API here.
-            socket.gethostbyname(socket.gethostname()),
+            cfg.CONF.router_id,
             best_path_change_handler=dump_remote_best_path_change)
         super(DRAgent, self).__init__()
 
@@ -143,8 +148,8 @@ class DRAgent(manager.Manager):
         # self.peers and self.advertise_networks. For any doubt, please check
         # out the module neutron.agent.l3_agent. Is quite similar (but more
         # complex) that we want to do.
-        self.peers.update(peers)
-        self.advertise_networks.update(networks)
+        # self.peers.update(peers)
+        # self.advertise_networks.update(networks)
 
 
 class DRAgentWithStateReport(DRAgent):
@@ -183,6 +188,10 @@ def main(manager='neutron.agent.dr_agent.DRAgentWithStateReport'):
     config.register_agent_state_opts_helper(cfg.CONF)
     config.register_root_helper(cfg.CONF)
     cfg.CONF.register_opts(external_process.OPTS)
+
+    # Configure the BGP speaker driver based on the setting in dr_agent.ini.
+    DRAgentWithStateReport.BGP_DRIVER_CLASS = importutils.import_class(
+        cfg.CONF.bgp_speaker_driver)
 
     common_config.init(sys.argv[1:])
     config.setup_logging(cfg.CONF)
