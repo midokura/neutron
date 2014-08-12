@@ -25,6 +25,7 @@ from neutron.api.v2 import attributes
 from neutron import context
 import neutron.db.api as db
 from neutron.extensions import portbindings
+from neutron import manager
 from neutron.plugins.cisco.common import cisco_exceptions as c_exc
 from neutron.plugins.cisco.db import n1kv_db_v2
 from neutron.plugins.cisco.db import network_db_v2 as cdb
@@ -67,7 +68,7 @@ class FakeResponse(object):
 def _fake_setup_vsm(self):
     """Fake establish Communication with Cisco Nexus1000V VSM."""
     self.agent_vsm = True
-    self._poll_policies(event_type="port_profile")
+    self._populate_policy_profiles()
 
 
 class NetworkProfileTestExtensionManager(object):
@@ -263,6 +264,8 @@ class TestN1kvNetworkProfiles(N1kvPluginTestCase):
             netp['network_profile']['sub_type'] = 'enhanced' or 'native_vxlan'
             netp['network_profile']['multicast_ip_range'] = ("224.1.1.1-"
                                                              "224.1.1.10")
+        elif segment_type == 'trunk':
+            netp['network_profile']['sub_type'] = 'vlan'
         return netp
 
     def test_create_network_profile_vlan(self):
@@ -276,6 +279,19 @@ class TestN1kvNetworkProfiles(N1kvPluginTestCase):
         net_p_req = self.new_create_request('network_profiles', data)
         res = net_p_req.get_response(self.ext_api)
         self.assertEqual(res.status_int, 201)
+
+    def test_create_network_profile_trunk(self):
+        data = self._prepare_net_profile_data('trunk')
+        net_p_req = self.new_create_request('network_profiles', data)
+        res = net_p_req.get_response(self.ext_api)
+        self.assertEqual(res.status_int, 201)
+
+    def test_create_network_profile_trunk_missing_subtype(self):
+        data = self._prepare_net_profile_data('trunk')
+        data['network_profile'].pop('sub_type')
+        net_p_req = self.new_create_request('network_profiles', data)
+        res = net_p_req.get_response(self.ext_api)
+        self.assertEqual(res.status_int, 400)
 
     def test_create_network_profile_overlay_unreasonable_seg_range(self):
         data = self._prepare_net_profile_data('overlay')
@@ -325,6 +341,27 @@ class TestN1kvNetworkProfiles(N1kvPluginTestCase):
                                              net_p['network_profile']['id'])
         update_res = update_req.get_response(self.ext_api)
         self.assertEqual(update_res.status_int, 400)
+
+    def test_update_network_profiles_with_networks_fail(self):
+        net_p = self._make_test_profile(name='netp1')
+        data = {'network_profile': {'segment_range': '200-210'}}
+        update_req = self.new_update_request('network_profiles',
+                                             data,
+                                             net_p['id'])
+        update_res = update_req.get_response(self.ext_api)
+        self.assertEqual(update_res.status_int, 200)
+        net_data = {'network': {'name': 'net1',
+                                n1kv.PROFILE_ID: net_p['id'],
+                                'tenant_id': 'some_tenant'}}
+        network_req = self.new_create_request('networks', net_data)
+        network_res = network_req.get_response(self.api)
+        self.assertEqual(network_res.status_int, 201)
+        data = {'network_profile': {'segment_range': '300-310'}}
+        update_req = self.new_update_request('network_profiles',
+                                             data,
+                                             net_p['id'])
+        update_res = update_req.get_response(self.ext_api)
+        self.assertEqual(update_res.status_int, 409)
 
     def test_create_overlay_network_profile_invalid_multicast_fail(self):
         net_p_dict = self._prepare_net_profile_data('overlay')
@@ -380,6 +417,81 @@ class TestN1kvNetworkProfiles(N1kvPluginTestCase):
         res = net_p_req.get_response(self.ext_api)
         self.assertEqual(res.status_int, 201)
 
+    def test_update_overlay_network_profile_correct_multicast_pass(self):
+        data = self._prepare_net_profile_data('overlay')
+        net_p_req = self.new_create_request('network_profiles', data)
+        res = net_p_req.get_response(self.ext_api)
+        self.assertEqual(res.status_int, 201)
+        net_p = self.deserialize(self.fmt, res)
+        data = {'network_profile': {'multicast_ip_range':
+                                    '224.0.1.0-224.0.1.100'}}
+        update_req = self.new_update_request('network_profiles',
+                                             data,
+                                             net_p['network_profile']['id'])
+        update_res = update_req.get_response(self.ext_api)
+        self.assertEqual(update_res.status_int, 200)
+
+    def test_create_overlay_network_profile_reservedip_multicast_fail(self):
+        net_p_dict = self._prepare_net_profile_data('overlay')
+        data = {'network_profile': {'multicast_ip_range':
+                                    '224.0.0.100-224.0.1.100'}}
+        net_p_req = self.new_create_request('network_profiles', data,
+                                            net_p_dict)
+        res = net_p_req.get_response(self.ext_api)
+        self.assertEqual(res.status_int, 400)
+
+    def test_update_overlay_network_profile_reservedip_multicast_fail(self):
+        data = self._prepare_net_profile_data('overlay')
+        net_p_req = self.new_create_request('network_profiles', data)
+        res = net_p_req.get_response(self.ext_api)
+        self.assertEqual(res.status_int, 201)
+        net_p = self.deserialize(self.fmt, res)
+        data = {'network_profile': {'multicast_ip_range':
+                                    '224.0.0.11-224.0.0.111'}}
+        update_req = self.new_update_request('network_profiles',
+                                             data,
+                                             net_p['network_profile']['id'])
+        update_res = update_req.get_response(self.ext_api)
+        self.assertEqual(update_res.status_int, 400)
+
+    def test_update_vlan_network_profile_multicast_fail(self):
+        net_p = self._make_test_profile(name='netp1')
+        data = {'network_profile': {'multicast_ip_range':
+                                    '224.0.1.0-224.0.1.100'}}
+        update_req = self.new_update_request('network_profiles',
+                                             data,
+                                             net_p['id'])
+        update_res = update_req.get_response(self.ext_api)
+        self.assertEqual(update_res.status_int, 400)
+
+    def test_update_trunk_network_profile_segment_range_fail(self):
+        data = self._prepare_net_profile_data('trunk')
+        net_p_req = self.new_create_request('network_profiles', data)
+        res = net_p_req.get_response(self.ext_api)
+        self.assertEqual(res.status_int, 201)
+        net_p = self.deserialize(self.fmt, res)
+        data = {'network_profile': {'segment_range':
+                                    '100-200'}}
+        update_req = self.new_update_request('network_profiles',
+                                             data,
+                                             net_p['network_profile']['id'])
+        update_res = update_req.get_response(self.ext_api)
+        self.assertEqual(update_res.status_int, 400)
+
+    def test_update_trunk_network_profile_multicast_fail(self):
+        data = self._prepare_net_profile_data('trunk')
+        net_p_req = self.new_create_request('network_profiles', data)
+        res = net_p_req.get_response(self.ext_api)
+        self.assertEqual(res.status_int, 201)
+        net_p = self.deserialize(self.fmt, res)
+        data = {'network_profile': {'multicast_ip_range':
+                                    '224.0.1.0-224.0.1.100'}}
+        update_req = self.new_update_request('network_profiles',
+                                             data,
+                                             net_p['network_profile']['id'])
+        update_res = update_req.get_response(self.ext_api)
+        self.assertEqual(update_res.status_int, 400)
+
     def test_create_network_profile_populate_vlan_segment_pool(self):
         db_session = db.get_session()
         net_p_dict = self._prepare_net_profile_data('vlan')
@@ -403,6 +515,17 @@ class TestN1kvNetworkProfiles(N1kvPluginTestCase):
                           db_session,
                           PHYS_NET,
                           VLAN_MAX + 1)
+
+    def test_delete_network_profile_with_network_fail(self):
+        net_p = self._make_test_profile(name='netp1')
+        net_data = {'network': {'name': 'net1',
+                                n1kv.PROFILE_ID: net_p['id'],
+                                'tenant_id': 'some_tenant'}}
+        network_req = self.new_create_request('networks', net_data)
+        network_res = network_req.get_response(self.api)
+        self.assertEqual(network_res.status_int, 201)
+        self._delete('network_profiles', net_p['id'],
+                     expected_code=409)
 
     def test_delete_network_profile_deallocate_vlan_segment_pool(self):
         db_session = db.get_session()
@@ -502,6 +625,55 @@ class TestN1kvPorts(test_plugin.TestPortsV2,
             res = port_req.get_response(self.api)
             self.assertEqual(res.status_int, 500)
             client_patch.stop()
+
+
+class TestN1kvPolicyProfiles(N1kvPluginTestCase):
+    def test_populate_policy_profile(self):
+        client_patch = patch(n1kv_client.__name__ + ".Client",
+                             new=fake_client.TestClient)
+        client_patch.start()
+        instance = n1kv_neutron_plugin.N1kvNeutronPluginV2()
+        instance._populate_policy_profiles()
+        db_session = db.get_session()
+        profile = n1kv_db_v2.get_policy_profile(
+            db_session, '00000000-0000-0000-0000-000000000001')
+        self.assertEqual('pp-1', profile['name'])
+        client_patch.stop()
+
+    def test_populate_policy_profile_delete(self):
+        # Patch the Client class with the TestClient class
+        with patch(n1kv_client.__name__ + ".Client",
+                   new=fake_client.TestClient):
+            # Patch the _get_total_profiles() method to return a custom value
+            with patch(fake_client.__name__ +
+                       '.TestClient._get_total_profiles') as obj_inst:
+                # Return 3 policy profiles
+                obj_inst.return_value = 3
+                plugin = manager.NeutronManager.get_plugin()
+                plugin._populate_policy_profiles()
+                db_session = db.get_session()
+                profile = n1kv_db_v2.get_policy_profile(
+                    db_session, '00000000-0000-0000-0000-000000000001')
+                # Verify that DB contains only 3 policy profiles
+                self.assertEqual('pp-1', profile['name'])
+                profile = n1kv_db_v2.get_policy_profile(
+                    db_session, '00000000-0000-0000-0000-000000000002')
+                self.assertEqual('pp-2', profile['name'])
+                profile = n1kv_db_v2.get_policy_profile(
+                    db_session, '00000000-0000-0000-0000-000000000003')
+                self.assertEqual('pp-3', profile['name'])
+                self.assertRaises(c_exc.PolicyProfileIdNotFound,
+                                  n1kv_db_v2.get_policy_profile,
+                                  db_session,
+                                  '00000000-0000-0000-0000-000000000004')
+                # Return 2 policy profiles
+                obj_inst.return_value = 2
+                plugin._populate_policy_profiles()
+                # Verify that the third policy profile is deleted
+                self.assertRaises(c_exc.PolicyProfileIdNotFound,
+                                  n1kv_db_v2.get_policy_profile,
+                                  db_session,
+                                  '00000000-0000-0000-0000-000000000003')
 
 
 class TestN1kvNetworks(test_plugin.TestNetworksV2,

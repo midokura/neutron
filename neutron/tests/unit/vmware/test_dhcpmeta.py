@@ -71,6 +71,11 @@ class DhcpMetadataBuilderTestCase(base.BaseTestCase):
     def test_router_id_get_none_subnet(self):
         self.assertIsNone(self.builder.router_id_get(mock.ANY, None))
 
+    def test_router_id_get_none_no_router(self):
+        self.builder.plugin.get_ports.return_value = []
+        subnet = {'network_id': self.network_id}
+        self.assertIsNone(self.builder.router_id_get(mock.ANY, subnet))
+
     def test_metadata_deallocate(self):
         self.builder.metadata_deallocate(
             mock.ANY, self.router_id, self.subnet_id)
@@ -265,6 +270,7 @@ class LsnManagerTestCase(base.BaseTestCase):
         self.lsn_port_id = 'foo_lsn_port_id'
         self.tenant_id = 'foo_tenant_id'
         self.manager = lsn_man.LsnManager(mock.Mock())
+        self.context = context.get_admin_context()
         self.mock_lsn_api_p = mock.patch.object(lsn_man, 'lsn_api')
         self.mock_lsn_api = self.mock_lsn_api_p.start()
         self.mock_nsx_utils_p = mock.patch.object(lsn_man, 'nsx_utils')
@@ -567,14 +573,22 @@ class LsnManagerTestCase(base.BaseTestCase):
             'network_id': self.net_id,
             'tenant_id': self.tenant_id
         }
+        expected_data = {
+            'subnet_id': subnet['id'],
+            'ip_address': subnet['cidr'],
+            'mac_address': constants.METADATA_MAC
+        }
         self.mock_nsx_utils.get_nsx_switch_ids.return_value = [self.switch_id]
         with mock.patch.object(lsn_man.switch_api, 'create_lport') as f:
-            f.return_value = {'uuid': self.port_id}
-            self.manager.lsn_port_metadata_setup(
-                mock.Mock(), self.lsn_id, subnet)
-            self.assertEqual(1, self.mock_lsn_api.lsn_port_create.call_count)
-            self.mock_lsn_api.lsn_port_plug_network.assert_called_once_with(
-                mock.ANY, self.lsn_id, mock.ANY, self.port_id)
+            with mock.patch.object(self.manager, 'lsn_port_create') as g:
+                f.return_value = {'uuid': self.port_id}
+                self.manager.lsn_port_metadata_setup(
+                    self.context, self.lsn_id, subnet)
+                (self.mock_lsn_api.lsn_port_plug_network.
+                 assert_called_once_with(mock.ANY, self.lsn_id,
+                                         mock.ANY, self.port_id))
+                g.assert_called_once_with(
+                    self.context, self.lsn_id, expected_data)
 
     def test_lsn_port_metadata_setup_raise_not_found(self):
         subnet = {
@@ -657,14 +671,10 @@ class LsnManagerTestCase(base.BaseTestCase):
 
     def test_lsn_port_host_conf_lsn_port_not_found(self):
         with mock.patch.object(
-            self.manager,
-            'lsn_port_get',
-            side_effect=p_exc.LsnPortNotFound(lsn_id=self.lsn_id,
-                                              entity='subnet',
-                                              entity_id=self.sub_id)):
-            self.assertRaises(p_exc.PortConfigurationError,
-                              self.manager._lsn_port_host_conf, mock.ANY,
-                              self.net_id, self.sub_id, mock.ANY, mock.Mock())
+            self.manager, 'lsn_port_get', return_value=(None, None)) as f:
+            self.manager._lsn_port_host_conf(
+                mock.ANY, self.net_id, self.sub_id, mock.ANY, mock.Mock())
+            self.assertEqual(1, f.call_count)
 
     def _test_lsn_port_update(self, dhcp=None, meta=None):
         self.manager.lsn_port_update(
@@ -1142,6 +1152,12 @@ class DhcpTestCase(base.BaseTestCase):
             self.plugin, mock.ANY, network, 'create_network')
         self.plugin.lsn_manager.lsn_create.assert_called_once_with(
             mock.ANY, network['id'])
+
+    def test_handle_create_network_router_external(self):
+        network = {'id': 'foo_network_id', 'router:external': True}
+        nsx.handle_network_dhcp_access(
+            self.plugin, mock.ANY, network, 'create_network')
+        self.assertFalse(self.plugin.lsn_manager.lsn_create.call_count)
 
     def test_handle_delete_network(self):
         network_id = 'foo_network_id'
