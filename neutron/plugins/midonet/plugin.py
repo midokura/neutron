@@ -34,7 +34,6 @@ from sqlalchemy import exc as sa_exc
 from neutron.common import exceptions as n_exc
 from neutron.common import rpc as n_rpc
 from neutron.common import topics
-from neutron.common import utils
 from neutron.db import agents_db
 from neutron.db import api as db
 from neutron.db import agentschedulers_db
@@ -212,7 +211,12 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
 
         with context.session.begin(subtransactions=True):
             super(MidonetPluginV2, self).delete_network(context, id)
+
+        try:
             self.api_cli.delete_network(id)
+        except Exception as ex:
+            LOG.error(_("Failed to delete a network in MN %(id)s: %(err)s"),
+                      {"id": id, "err": ex})
 
         LOG.info(_("MidonetPluginV2.delete_network exiting: id=%r"), id)
 
@@ -280,25 +284,23 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
             # Update fields
             port_data.update(new_port)
 
-            # Bind security groups to the port
-            self._ensure_default_security_group_on_port(context, port)
-            sg_ids = self._get_security_groups_on_port(context, port)
-            self._process_port_create_security_group(context, new_port, sg_ids)
-
-            self._process_portbindings_create_and_update(context, port_data,
-                                                         new_port)
-
         return new_port
 
     @handle_api_error
-    @utils.synchronized('port-critical-section', external=True)
     def create_port(self, context, port):
         """Create a L2 port in Neutron/MidoNet."""
         LOG.info(_("MidonetPluginV2.create_port called: port=%r"), port)
 
+        port_data = port['port']
         new_port = self._process_create_port(context, port)
 
         try:
+            # Bind security groups to the port
+            self._ensure_default_security_group_on_port(context, port)
+            sg_ids = self._get_security_groups_on_port(context, port)
+            self._process_port_create_security_group(context, new_port, sg_ids)
+            self._process_portbindings_create_and_update(context, port_data,
+                                                         new_port)
             self.api_cli.create_port(new_port)
         except Exception as ex:
             LOG.error(_("Failed to create a port %(new_port)s: %(err)s"),
@@ -323,9 +325,15 @@ class MidonetPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
             self.prevent_l3_port_deletion(context, id)
 
         with context.session.begin(subtransactions=True):
-            super(MidonetPluginV2, self).disassociate_floatingips(context, id)
+            super(MidonetPluginV2, self).disassociate_floatingips(
+                context, id, do_notify=False)
             super(MidonetPluginV2, self).delete_port(context, id)
+
+        try:
             self.api_cli.delete_port(id)
+        except Exception as ex:
+            LOG.error(_("Failed to delete a port in MN %(id)s: %(err)s"),
+                      {"id": id, "err": ex})
 
         LOG.info(_("MidonetPluginV2.delete_port exiting: id=%r"), id)
 
