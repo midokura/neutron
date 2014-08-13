@@ -1,5 +1,5 @@
 [gerrit]
-host=review.openstack.org
+host=reviews.midonet.org
 port=29418
-project=openstack/neutron.git
+project=neutron.git
 defaultbranch=stable/icehouse
